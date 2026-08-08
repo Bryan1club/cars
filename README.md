@@ -1,20 +1,23 @@
 # Car Club System
 
 MicroPython app for a Pico Computer 3, used to manage car club member
-records and run event check-ins on a single board (no networking).
+records and run event check-ins on a board. Can run standalone or join
+WiFi to sync its clock, send emails, and forward uploads to other
+boards.
 
 ## Files
 
-- **club.py** — main app. SQLite-backed (`/sd/club.db`), with pages for
-  the menu, member records, member cars, and events (create an event,
-  start/stop it, check members in, see who's attended).
-- **members.py** — standalone member record editor. Stores each member
-  as a JSON file under `/sd/members/`. Simpler than `club.py` and does
-  not handle cars or events.
-- **menu.py** — launcher screen listing tools (`club.py`, `members.py`,
-  plus `import.py`, `export.py`, `upload.py`, `settings.py`, which
-  aren't present in this repo yet) and dimming any that aren't
-  installed on the board.
+- **main.py** — runs at boot. Starts the board as its own WiFi access
+  point, tries to join a home/venue network to sync the clock, then
+  launches `club.py`. **Fill in your own AP/WiFi credentials before
+  deploying** — the placeholders in this repo are not real ones.
+- **club.py** — the app itself. SQLite-backed (`/sd/club.db`), with
+  pages for members, their cars, events (create, start/stop, check
+  members in, see who attended), WiFi setup, email, and forwarding
+  uploads to other boards.
+- **menu.py**, **members.py** — an earlier, simpler version of this
+  system (standalone member editor + tool launcher). Not used by
+  `main.py` / `club.py` anymore; kept here for reference.
 
 Roles and membership statuses are configurable per-board via
 `/sd/roles.txt` and `/sd/status.txt` (one value per line, `-` for a
@@ -23,5 +26,13 @@ run if missing.
 
 ## Running
 
-Copy the script you want as `/main.py` on the board so it runs at
-boot, or run it directly from the MicroPython REPL.
+Copy `main.py` and `club.py` onto the board's SD card, fill in your
+own WiFi credentials in `main.py`, and it runs automatically at boot.
+
+## A note on syncing from the board
+
+The board's SD card mixes code with live data — member records
+(`club.db`), saved WiFi passwords (`wifi.txt`), exported CSVs, member
+photos, and upload logs. None of that belongs in this repo. Only copy
+`.py` files across deliberately, and check them for hardcoded secrets
+or personal details first (see `.gitignore` for what's excluded).
