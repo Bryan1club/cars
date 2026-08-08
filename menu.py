@@ -17,6 +17,7 @@ DIM = 0x9AB49A
 HERE = "/"
 
 ITEMS = [
+    ("Club", "club.py", "Members, cars and events, all in one"),
     ("Members", "members.py", "Look up, add and edit records"),
     ("Import", "import.py", "Load a CSV into records"),
     ("Export", "export.py", "Write records out as CSV"),
