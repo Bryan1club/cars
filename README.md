@@ -11,10 +11,10 @@ records and run event check-ins on a single board (no networking).
 - **members.py** — standalone member record editor. Stores each member
   as a JSON file under `/sd/members/`. Simpler than `club.py` and does
   not handle cars or events.
-- **menu.py** — launcher screen listing tools (`members.py`, plus
-  `import.py`, `export.py`, `upload.py`, `settings.py`, which aren't
-  present in this repo yet) and dimming any that aren't installed on
-  the board.
+- **menu.py** — launcher screen listing tools (`club.py`, `members.py`,
+  plus `import.py`, `export.py`, `upload.py`, `settings.py`, which
+  aren't present in this repo yet) and dimming any that aren't
+  installed on the board.
 
 Roles and membership statuses are configurable per-board via
 `/sd/roles.txt` and `/sd/status.txt` (one value per line, `-` for a
