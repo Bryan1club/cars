@@ -1,0 +1,11 @@
+# Board data and secrets -- never commit these.
+# The board's SD card mixes code with live data; only copy .py files
+# over deliberately, one at a time, and check for secrets first.
+club.db
+wifi.txt
+forward.txt
+upload_log.txt
+*.csv
+exports/
+cars/
+models/
