@@ -13,9 +13,10 @@
 #
 # Draws boxes, lines, circles, and arcs; lets you SELECT and undo/redo;
 # supports named layers with show/hide; saves/loads named models to
-# /sd/models; and shows a live isometric wireframe view with zoom, pan,
-# and grid snapping. LINE has both a typed-numbers entry and a
-# click-on-the-grid entry mode. Icons for the command buttons are
+# /sd/models; and shows a live rotatable wireframe view with zoom, pan,
+# grid snapping, and a WIRE toggle to hide/show the modelled geometry.
+# LINE has both a typed-numbers entry and a click-on-the-grid entry
+# mode. Icons for the command buttons are
 # expected at /sd/icons/<name>.bmp (26x26, see this project's
 # assets/icons/*.svg for the sources) -- if they're missing, the
 # buttons still work, they just won't have an icon drawn on them.
@@ -39,6 +40,8 @@ from pcconsole import console
 MODELS_DIR = "/sd/models"     # saved 3D models
 ICONS_DIR = "/sd/icons"       # command button icons (26x26 .bmp)
 UPLOAD_LOG = "/sd/model3d_editor_log.txt"  # separate from club.py's own log
+UPLOAD_LOG_MAX_BYTES = 100000  # truncated (not deleted) once exceeded, so a chatty
+                                # diagnostic caller can't quietly fill the SD card
 
 PAGE = 0x66B2FF
 INK = 0x103018
@@ -47,6 +50,17 @@ BTN = 0x2E7D32
 
 def ulog(text):
     try:
+        try:
+            if os.stat(UPLOAD_LOG)[6] > UPLOAD_LOG_MAX_BYTES:
+                # truncate rather than remove -- keeps the path present
+                # so anything else opening it for read doesn't hit a
+                # missing-file error, just starts it fresh instead of
+                # ever growing past the cap
+                f = open(UPLOAD_LOG, "w")
+                f.write("--- log truncated: exceeded %d bytes ---\n" % UPLOAD_LOG_MAX_BYTES)
+                f.close()
+        except OSError:
+            pass  # file doesn't exist yet -- nothing to truncate
         f = open(UPLOAD_LOG, "a")
         t = time.localtime()
         s = "%04d-%02d-%02d %02d:%02d:%02d  " % (t[0], t[1], t[2], t[3], t[4], t[5])
@@ -95,7 +109,10 @@ def _fb_line(fb, x0, y0, x1, y1, color):
 #   LINE x0 y0 z0 x1 y1 z1 layer       -- endpoints
 #   CIRCLE cx cy cz radius plane layer -- plane is XY/XZ/YZ
 #   ARC cx cy cz radius plane start end layer  -- start/end in degrees
-#   GRID plane spacing extent    -- at most one per file, no layer
+#   GRID plane spacing extent [position]  -- at most one per file, no
+#     layer; position is where the grid sits along its plane's normal
+#     axis (Z for XY, Y for XZ, X for YZ) -- omitted/missing means 0,
+#     for files saved before this field existed
 #   LAYER name visible           -- visible is 1 or 0, one per layer
 def serialize_model(boxes, lines, circles, arcs, grid, layers, layer_visible):
     out = []
@@ -108,8 +125,8 @@ def serialize_model(boxes, lines, circles, arcs, grid, layers, layer_visible):
     for (c, r, plane, a0, a1, layer) in arcs:
         out.append("ARC %g %g %g %g %s %g %g %s" % (c[0], c[1], c[2], r, plane, a0, a1, layer))
     if grid:
-        plane, spacing, extent = grid
-        out.append("GRID %s %g %g" % (plane, spacing, extent))
+        plane, spacing, extent, position = grid
+        out.append("GRID %s %g %g %g" % (plane, spacing, extent, position))
     for name in layers:
         out.append("LAYER %s %d" % (name, 1 if layer_visible.get(name, True) else 0))
     return "\n".join(out) + "\n"
@@ -150,8 +167,10 @@ def parse_model(text):
         elif parts[0] == "ARC" and len(parts) >= 8:
             arcs.append(((float(parts[1]), float(parts[2]), float(parts[3])),
                          float(parts[4]), parts[5], float(parts[6]), float(parts[7]), "Layer1"))
+        elif parts[0] == "GRID" and len(parts) >= 5:
+            grid = (parts[1], float(parts[2]), float(parts[3]), float(parts[4]))
         elif parts[0] == "GRID" and len(parts) >= 4:
-            grid = (parts[1], float(parts[2]), float(parts[3]))
+            grid = (parts[1], float(parts[2]), float(parts[3]), 0.0)
         elif parts[0] == "LAYER" and len(parts) >= 3:
             layers.append(parts[1])
             layer_visible[parts[1]] = parts[2] != "0"
@@ -202,24 +221,41 @@ def delete_model_file(name):
         return False
 
 
+# command name -> icon file under ICONS_DIR (see assets/icons/*.svg in
+# the repo -- rendered to 26x26 BMP) -- module level so both
+# Model3DPage's own buttons and HelpPage's icon-illustrated entries for
+# the "model3d" topic can use the same mapping
+ICON_NAMES = {
+    "NEW FILE": "new_file", "OPEN": "open", "SAVE AS": "save_as", "DELETE": "delete",
+    "SELECT": "select", "LINE": "line", "CTR LINE": "centerline", "BOX": "box",
+    "CIRCLE": "circle", "ARC": "arc", "GRID": "grid",
+}
+
 HELP_TEXT = {
     "model3d": ("3D Model Editor", [
         ("NEW FILE", "Type X/Y/Z size in mm and CREATE a box -- clears everything else currently modelled."),
         ("OPEN", "Pick a saved model from the list and load it into the viewer."),
         ("SAVE AS", "Type a name and save everything currently modelled to the SD card."),
-        ("DELETE", "Pick a saved model from the list and remove that file."),
-        ("SELECT", "Click near an item's outline in the VIEW panel to select it (highlighted yellow) -- pick another command to cancel."),
+        ("DELETE", "If something is SELECTED (highlighted red), removes just that item (undoable). Otherwise, pick a saved model from the list and remove that file."),
+        ("SELECT", "Click near an item's outline in the VIEW panel to select it (highlighted red) -- press DELETE to remove it, or pick another command to cancel."),
         ("LINE", "Choose CLICK ON GRID (tap start then end point in the VIEW panel, snaps to the grid if one's set) or TYPE VALUES (enter X/Y/Z numbers)."),
-        ("CTR LINE", "Pick an axis (tap to cycle X/Y/Z) and a length -- adds a line through the origin along that axis."),
-        ("BOX", "Enter one corner, then the opposite corner, to add a box anywhere (doesn't replace NEW FILE's box)."),
-        ("CIRCLE", "Enter a centre point and radius; tap the plane button to cycle XY/XZ/YZ."),
+        ("CTR LINE", "Pick an axis (tap to cycle X/Y/Z) and a length -- adds a line through the origin along that axis. Snaps the length to the nearest GRID spacing if a grid is set."),
+        ("BOX", "Choose CLICK ON GRID (tap one corner then the opposite corner in the VIEW panel) or TYPE VALUES (enter X/Y/Z numbers)."),
+        ("CIRCLE", "Enter a centre point and radius; tap the plane button to cycle XY/XZ/YZ. Adds a selectable centre-mark crosshair through the middle too."),
         ("ARC", "Same as CIRCLE plus a start/end angle in degrees, swept counter-clockwise."),
-        ("GRID", "Set a spacing, extent, and plane (tap to cycle XY/XZ/YZ) to show a dotted reference plane. Replaces any existing grid."),
+        ("GRID", "Set a spacing, extent, plane (tap to cycle XY/XZ/YZ), and position along that plane's normal axis (e.g. Y for an XZ 'vertical' grid, to line it up with a wall). Replaces any existing grid. Once set, every typed X/Y/Z/radius/angle value in every dialog rounds to this spacing."),
         ("LAYER button", "Shows the active layer -- new items go on it. Opens LAYERS: pick one then SET ACTIVE, TOGGLE SHOW (hide/unhide), or NEW LAYER."),
-        ("VIEW panel", "Isometric view of everything modelled -- X is red, Y is green, Z is blue, all from the origin marked 0,0."),
-        ("+ / - / RST", "Zoom in, zoom out, or reset the view back to its default position and zoom."),
+        ("VIEW panel", "Rotatable view of everything modelled -- X is red, Y is green, Z is blue, all from the origin marked 0,0."),
+        ("+ / - / RST", "Zoom in, zoom out, or reset the view back to its default position, zoom, and rotation."),
         ("U / D / L / R", "Pan the view up/down/left/right in fixed steps."),
-        ("UNDO / REDO", "Step back or forward through NEW FILE/OPEN/LINE/BOX/CIRCLE/ARC/GRID changes."),
+        ("AZ - / AZ +", "Spin the viewpoint left/right around the model."),
+        ("EL - / EL +", "Tilt the viewpoint down/up, from edge-on towards looking straight down."),
+        ("WIRE", "Show or hide LINE/CIRCLE/ARC entries -- BOX, the grid, and the axis arrows stay visible either way."),
+        ("GRID button", "Below the mouse position readout -- shows or hides the GRID dots on their own, independent of WIRE."),
+        ("SNAP", "Master on/off for grid snapping -- when off, every typed value and click position is used exactly as entered even if a GRID is set."),
+        ("EXTRUDE", "SELECT anything first, then give a height in mm: LINE becomes a wall, BOX grows taller, CIRCLE becomes a cylinder, ARC becomes a curved wall."),
+        ("EDIT", "SELECT anything first -- opens its points/radius/angles pre-filled so you can fix a mistake without deleting and redrawing it. Also has its own DELETE THIS ITEM button."),
+        ("UNDO / REDO", "Step back or forward through NEW FILE/OPEN/LINE/BOX/CIRCLE/ARC/GRID/EXTRUDE/EDIT changes."),
         ("MENU", "Exit the editor."),
     ]),
 }
@@ -258,10 +294,19 @@ class Page:
 
 
 class HelpPage(Page):
+    # content rows run from just under the title/BACK row down to
+    # ROW_BOTTOM, leaving room below that for PREV/NEXT when a topic
+    # doesn't fit on one screen
+    ROW_TOP = 34
+    ROW_BOTTOM = 404
+    ICON_SIZE = 26
+    ICON_GAP = 8
+
     def __init__(self, topic, return_to):
         Page.__init__(self)
         self.topic = topic
         self.return_to = return_to
+        self.page = 0
 
     def wrap(self, text, width=76):
         words = text.split(" ")
@@ -282,20 +327,84 @@ class HelpPage(Page):
             lines[1] = lines[1][:width - 3] + "..."
         return lines
 
+    def _row_height(self, label, desc):
+        text_h = 18 + 14 * len(self.wrap(desc, self._desc_width(label)))
+        icon_h = self.ICON_SIZE if label in ICON_NAMES else 0
+        return max(text_h, icon_h) + 8
+
+    def _desc_width(self, label):
+        # narrower wrap for rows with an icon -- their text starts
+        # further right, so fewer characters fit per line
+        return 66 if label in ICON_NAMES else 76
+
+    def _paginate(self, entries):
+        pages = []
+        current = []
+        y = self.ROW_TOP
+        for entry in entries:
+            h = self._row_height(entry[0], entry[1])
+            if current and y + h > self.ROW_BOTTOM:
+                pages.append(current)
+                current = []
+                y = self.ROW_TOP
+            current.append(entry)
+            y += h
+        pages.append(current)
+        return pages
+
+    def _redraw(self):
+        try:
+            self.g.stop()
+        except Exception:
+            pass
+        g = pcgui.GUI()
+        self.g = g
+        g.start()
+        self.build(g)
+
     def build(self, g):
         title, entries = HELP_TEXT.get(self.topic, ("Help", []))
-        g.caption(320, 6, "Help -- " + title, fg=INK, bg=PAGE, font=3, just="CT")
+        pages = self._paginate(entries)
+        self.page = max(0, min(self.page, len(pages) - 1))
+        page_entries = pages[self.page]
+
+        header = "Help -- " + title
+        if len(pages) > 1:
+            header += "  (%d/%d)" % (self.page + 1, len(pages))
+        g.caption(320, 6, header, fg=INK, bg=PAGE, font=3, just="CT")
         g.button(486, 4, 140, 28, "BACK", fg=WHITE, bg=RED, font=2, callback=self.on_back)
-        y = 34
-        for label, desc in entries:
-            if y > 404:
-                break  # keep it on one screen -- longer topics get trimmed
-            g.caption(20, y, label, fg=INK, bg=PAGE, font=2)
-            y += 18
-            for line in self.wrap(desc):
-                g.caption(30, y, line, fg=INK, bg=PAGE, font=1)
-                y += 14
-            y += 8
+
+        y = self.ROW_TOP
+        for label, desc in page_entries:
+            icon_name = ICON_NAMES.get(label)
+            text_x = 20
+            if icon_name:
+                path = ICONS_DIR + "/" + icon_name + ".bmp"
+                try:
+                    pcimage.draw_bmp(path, 20, y, dither=True)
+                except Exception as e:
+                    ulog("HelpPage: icon load failed for " + label + ": " + type(e).__name__ + " " + str(e))
+                text_x = 20 + self.ICON_SIZE + self.ICON_GAP
+            g.caption(text_x, y, label, fg=INK, bg=PAGE, font=2)
+            ty = y + 18
+            for line in self.wrap(desc, self._desc_width(label)):
+                g.caption(text_x + 10, ty, line, fg=INK, bg=PAGE, font=1)
+                ty += 14
+            y += self._row_height(label, desc)
+
+        if len(pages) > 1:
+            if self.page > 0:
+                g.button(20, 440, 90, 28, "PREV", fg=WHITE, bg=BTN, font=2, callback=self.on_prev_page)
+            if self.page < len(pages) - 1:
+                g.button(530, 440, 90, 28, "NEXT", fg=WHITE, bg=BTN, font=2, callback=self.on_next_page)
+
+    def on_prev_page(self, b):
+        self.page -= 1
+        self._redraw()
+
+    def on_next_page(self, b):
+        self.page += 1
+        self._redraw()
 
     def on_back(self, b):
         self.go(self.return_to)
@@ -396,13 +505,61 @@ class Model3DPage(Page):
     # each other count as one drag -- see the caveat on on_touch
     DRAG_TIMEOUT_MS = 500
 
-    # true isometric projection, still rotation-free (no quaternion/
-    # camera machinery) -- X and Y both tilted 30 degrees off
-    # horizontal, Z straight up: X goes down-right, Y goes down-left,
-    # matching the standard technical-drawing isometric layout. All
-    # three axes share one scale (no depth foreshortening).
-    ISO_COS30 = 0.8660254
-    ISO_SIN30 = 0.5
+    # rotate/wireframe row, directly under the VIEW canvas -- azimuth
+    # (spin) and elevation (tilt) step buttons plus the wireframe
+    # show/hide toggle, all left-aligned under the canvas so they never
+    # reach as far right as MENU
+    ROT_BTN_Y = CANVAS_Y1 + 6
+    ROT_BTN_H = 26
+    ROT_STEP_BTN_W = 56
+    ROT_GAP = 6
+    AZ_MINUS_X = CANVAS_X0
+    AZ_PLUS_X = AZ_MINUS_X + ROT_STEP_BTN_W + ROT_GAP
+    EL_MINUS_X = AZ_PLUS_X + ROT_STEP_BTN_W + ROT_GAP
+    EL_PLUS_X = EL_MINUS_X + ROT_STEP_BTN_W + ROT_GAP
+    WIRE_BTN_X = EL_PLUS_X + ROT_STEP_BTN_W + ROT_GAP + 10
+    WIRE_BTN_W = 130
+
+    # mouse position readout -- narrowed from its original 260 to make
+    # room for GRID/EXTRUDE/SNAP/EDIT sharing the rest of this row
+    MOUSE_BOX_W = 220
+
+    # GRID show/hide toggle, SNAP master on/off, EXTRUDE, and EDIT all
+    # share this row beside the mouse position readout, since the row
+    # under the canvas is already full
+    GRID_BTN_Y = PANEL_Y + PANEL_H + 4
+    GRID_BTN_H = 20
+    GRID_BTN_X = PANEL_X + MOUSE_BOX_W + 14
+    GRID_BTN_W = 90
+    EXTRUDE_BTN_X = GRID_BTN_X + GRID_BTN_W + 6
+    EXTRUDE_BTN_W = 100
+    SNAP_BTN_X = EXTRUDE_BTN_X + EXTRUDE_BTN_W + 6
+    SNAP_BTN_W = 90
+    EDIT_BTN_X = SNAP_BTN_X + SNAP_BTN_W + 6
+    EDIT_BTN_W = 60
+
+    # orbit-camera projection: an azimuth (spin around the vertical Z
+    # axis) and an elevation (tilt between edge-on and looking straight
+    # down) drive a plain rotation, then dropped straight to screen X/Y
+    # -- orthographic, no perspective, no depth foreshortening, still
+    # no quaternion/camera machinery. Z always renders straight up on
+    # screen regardless of azimuth. The defaults below (45/30) reproduce
+    # the project's original fixed isometric look -- X down-right,
+    # Y down-left, Z up -- as just one point in the now-rotatable range.
+    AZIMUTH_DEFAULT = 45.0
+    ELEVATION_DEFAULT = 30.0
+    AZIMUTH_STEP = 15.0
+    ELEVATION_STEP = 10.0
+    ELEVATION_MIN = -80.0
+    ELEVATION_MAX = 80.0
+
+    # world-space unit basis vectors spanning each GRID/click plane,
+    # used to turn a screen click back into a 3D point on that plane
+    # (see _screen_to_plane_point) -- generic across any azimuth/
+    # elevation rather than a per-plane formula tied to one fixed view
+    PLANE_BASIS = {"XY": ((1, 0, 0), (0, 1, 0)),
+                   "XZ": ((1, 0, 0), (0, 0, 1)),
+                   "YZ": ((0, 1, 0), (0, 0, 1))}
 
     # (0,0,0) is pinned to a fixed spot in the lower-right area of the
     # canvas rather than auto-centring the whole model -- as fractions
@@ -424,8 +581,16 @@ class Model3DPage(Page):
     AXIS_PERP = {"X": (0, 1, 0), "Y": (1, 0, 0), "Z": (1, 0, 0)}
     AXIS_COLORS = {"X": RED, "Y": 0x00CC00, "Z": 0x3399FF}
 
-    # SELECT -- click near an element's projected outline to select it
-    SELECT_COLOR = 0xFFFF00  # yellow, distinct from white geometry and the axis colours
+    # SELECT -- click near an element's projected outline to select it.
+    # RED, not a raw hex literal like the original yellow (0xFFFF00) --
+    # confirmed on real hardware that a "selected" item hit-tested fine
+    # (status bar showed "SELECTED: ...") but rendered as nothing at
+    # all, which a raw untested colour value silently failing in
+    # _fb_line/_fb_pixel's own try/except would explain. RED is
+    # imported from pcgfx (like WHITE) rather than being a raw literal,
+    # and is already proven to draw via this exact framebuffer path
+    # (the dashed active-command frame, the LINE start-point marker).
+    SELECT_COLOR = RED
     SELECT_THRESHOLD = 15    # px -- closest hit within this radius wins
 
     def __init__(self):
@@ -447,8 +612,10 @@ class Model3DPage(Page):
         self.circle_plane = "XY"   # cycles XY -> XZ -> YZ, within the CIRCLE dialog
         self.arc_plane = "XY"      # same, within the ARC dialog
         self.grid_plane = "XY"     # same, within the GRID dialog
-        self.grid = None          # (plane, spacing, extent) or None -- one grid at a time,
+        self.grid = None          # (plane, spacing, extent, position) or None -- one grid at a time,
                                    # a fresh GRID replaces whatever grid was already there
+        self.snap_enabled = True  # master switch -- grid snapping only actually applies
+                                   # when this is True AND self.grid is set
         self.centerline_axis = "X"  # cycles X -> Y -> Z, within the CTR LINE dialog
 
         # layers -- every box/line/circle/arc is tagged with the name
@@ -472,13 +639,26 @@ class Model3DPage(Page):
         self.pan_x = 0.0
         self.pan_y = 0.0
         self.zoom = 1.0
+        self.azimuth_deg = self.AZIMUTH_DEFAULT
+        self.elevation_deg = self.ELEVATION_DEFAULT
+        self._update_rotation_trig()
+        self.wireframe_visible = True  # hides boxes/lines/circles/arcs when off; grid/axes stay
+        self.grid_visible = True       # independent of wireframe_visible -- hides just the grid dots
         self._last_touch = None
         self._last_touch_time = 0
         self._last_scale = 1.0            # set for real by _draw_scene each redraw --
         self._last_origin = (0.0, 0.0)    # used by on_touch to report a model-space position
 
+        self.box_pick_start = None  # BOX's "CLICK ON GRID" mode -- first corner, or None
+
+        # diagnostic only -- counts every on_touch call regardless of
+        # dialog state, shown in the mouse readout so a hardware test
+        # can tell "on_touch never fired" apart from "on_touch fired
+        # but the pick logic did nothing"
+        self.touch_count = 0
+
         self.active_command = None  # last command clicked, gets the red dashed frame
-        self.selected = None  # (kind, index) e.g. ("box", 0), or None -- highlighted yellow
+        self.selected = None  # (kind, index) e.g. ("box", 0), or None -- highlighted red
 
         self.undo_stack = []  # snapshots of (boxes, lines, circles, arcs, grid)
         self.redo_stack = []  # cleared whenever a new action is taken, not just undone
@@ -504,6 +684,8 @@ class Model3DPage(Page):
             self._build_line_dialog(g)
         elif self.dialog == "centerline":
             self._build_centerline_dialog(g)
+        elif self.dialog == "box_choice":
+            self._build_box_choice_dialog(g)
         elif self.dialog == "box":
             self._build_box_dialog(g)
         elif self.dialog == "circle":
@@ -512,9 +694,13 @@ class Model3DPage(Page):
             self._build_arc_dialog(g)
         elif self.dialog == "grid":
             self._build_grid_dialog(g)
+        elif self.dialog == "extrude":
+            self._build_extrude_dialog(g)
+        elif self.dialog == "edit":
+            self._build_edit_dialog(g)
         elif self.dialog == "layers":
             self._build_layers_dialog(g)
-        elif self.dialog == "line_pick" or self.dialog == "select_pick":
+        elif self.dialog == "line_pick" or self.dialog == "select_pick" or self.dialog == "box_pick":
             # reuses the normal main layout (canvas, zoom, D-pad, all
             # of it) rather than a modal -- picking points/elements
             # needs the wireframe/grid actually visible and clickable,
@@ -523,18 +709,10 @@ class Model3DPage(Page):
         else:
             self._build_main(g)
 
-    # command name -> icon file under ICONS_DIR (see assets/icons/*.svg
-    # in the repo -- rendered to 26x26 BMP)
-    ICON_NAMES = {
-        "NEW FILE": "new_file", "OPEN": "open", "SAVE AS": "save_as", "DELETE": "delete",
-        "SELECT": "select", "LINE": "line", "CTR LINE": "centerline", "BOX": "box",
-        "CIRCLE": "circle", "ARC": "arc", "GRID": "grid",
-    }
-
     # command name -> its real dialog key
     COMMAND_DIALOG = {
         "NEW FILE": "newfile", "OPEN": "open", "SAVE AS": "saveas", "DELETE": "delete",
-        "SELECT": "select_pick", "LINE": "line_choice", "CTR LINE": "centerline", "BOX": "box",
+        "SELECT": "select_pick", "LINE": "line_choice", "CTR LINE": "centerline", "BOX": "box_choice",
         "CIRCLE": "circle", "ARC": "arc", "GRID": "grid",
     }
 
@@ -561,23 +739,42 @@ class Model3DPage(Page):
         self.status_box = g.displaybox(self.PANEL_X + self.PANEL_W + 20, self.PANEL_Y,
                                         640 - self.BORDER - (self.PANEL_X + self.PANEL_W + 20) - 8, 24,
                                         "Ready", fg=WHITE, bg=self.BLACK, font=2)
+        snap_status = "grid snap ON" if (self.grid and self.snap_enabled) else "not snapped"
         if self.dialog == "line_pick":
             verb = "START" if self.line_stage == "start" else "END"
-            snap = "grid snap ON" if self.grid else "no grid set, not snapped"
-            self.status_box.value = "LINE: click %s point in VIEW (%s) -- pick another command to cancel" % (verb, snap)
+            self.status_box.value = "LINE: click %s point in VIEW (%s) -- pick another command to cancel" % (verb, snap_status)
         elif self.dialog == "select_pick":
             self.status_box.value = "SELECT: click near an item in VIEW -- pick another command to cancel"
+        elif self.dialog == "box_pick":
+            verb = "FIRST" if self.box_pick_start is None else "OPPOSITE"
+            self.status_box.value = "BOX: click %s corner in VIEW (%s) -- pick another command to cancel" % (verb, snap_status)
 
         # mouse/touch coordinate readout below the panel
         self.mouse_box = g.displaybox(self.PANEL_X, self.PANEL_Y + self.PANEL_H + 4,
-                                       260, 20, "X:--  Y:--  Z:--", fg=WHITE, bg=self.BLACK, font=1)
+                                       self.MOUSE_BOX_W, 20, "X:--  Y:--  Z:--", fg=WHITE, bg=self.BLACK, font=1)
+        grid_label = "GRID: ON" if self.grid_visible else "GRID: OFF"
+        g.button(self.GRID_BTN_X, self.GRID_BTN_Y, self.GRID_BTN_W, self.GRID_BTN_H, grid_label,
+                 fg=WHITE, bg=BTN, font=1, callback=self.on_toggle_grid_visible)
+        snap_label = "SNAP: ON" if self.snap_enabled else "SNAP: OFF"
+        g.button(self.SNAP_BTN_X, self.GRID_BTN_Y, self.SNAP_BTN_W, self.GRID_BTN_H, snap_label,
+                 fg=WHITE, bg=BTN, font=1, callback=self.on_toggle_snap)
+        g.button(self.EXTRUDE_BTN_X, self.GRID_BTN_Y, self.EXTRUDE_BTN_W, self.GRID_BTN_H, "EXTRUDE",
+                 fg=WHITE, bg=BTN, font=1, callback=self.on_extrude_pressed)
+        g.button(self.EDIT_BTN_X, self.GRID_BTN_Y, self.EDIT_BTN_W, self.GRID_BTN_H, "EDIT",
+                 fg=WHITE, bg=BTN, font=1, callback=self.on_edit_pressed)
         try:
             g.on_touch(self.on_touch)
         except Exception as e:
             ulog("Model3DPage: on_touch registration failed: " + str(e))
-        # on_move (hover) is not used -- confirmed not to work on the
-        # hardware this was originally built/tested on. Panning below
-        # reuses on_touch instead.
+        # on_move (continuous hover) and mouse-wheel zoom were both
+        # tried and dropped again: dir(pcgui.GUI) on real hardware
+        # shows on_touch as the only interactive input method this
+        # class defines at all. on_move is a plain instance attribute
+        # rather than a registration method (assigning it didn't
+        # error), but assigning it made no observable difference on
+        # real hardware -- the mouse position readout stayed silent
+        # between clicks, confirming poll() never actually reads it.
+        # It's still updated on every click via on_touch below.
 
         g.button(522, 410, 110, 32, "MENU", fg=WHITE, bg=RED, font=2, callback=self.on_back)
 
@@ -601,6 +798,18 @@ class Model3DPage(Page):
             by = self.DPAD_Y0 + i * (self.DPAD_H + self.DPAD_GAP)
             g.button(self.DPAD_X, by, self.DPAD_W, self.DPAD_H, label,
                      fg=WHITE, bg=0x3399FF, font=1, callback=callback)
+
+        g.button(self.AZ_MINUS_X, self.ROT_BTN_Y, self.ROT_STEP_BTN_W, self.ROT_BTN_H, "AZ -",
+                 fg=WHITE, bg=0x3399FF, font=1, callback=self.on_rotate_az_minus)
+        g.button(self.AZ_PLUS_X, self.ROT_BTN_Y, self.ROT_STEP_BTN_W, self.ROT_BTN_H, "AZ +",
+                 fg=WHITE, bg=0x3399FF, font=1, callback=self.on_rotate_az_plus)
+        g.button(self.EL_MINUS_X, self.ROT_BTN_Y, self.ROT_STEP_BTN_W, self.ROT_BTN_H, "EL -",
+                 fg=WHITE, bg=0x3399FF, font=1, callback=self.on_rotate_el_minus)
+        g.button(self.EL_PLUS_X, self.ROT_BTN_Y, self.ROT_STEP_BTN_W, self.ROT_BTN_H, "EL +",
+                 fg=WHITE, bg=0x3399FF, font=1, callback=self.on_rotate_el_plus)
+        wire_label = "WIRE: ON" if self.wireframe_visible else "WIRE: OFF"
+        g.button(self.WIRE_BTN_X, self.ROT_BTN_Y, self.WIRE_BTN_W, self.ROT_BTN_H, wire_label,
+                 fg=WHITE, bg=BTN, font=1, callback=self.on_toggle_wireframe)
 
         # raw framebuffer drawing happens LAST, strictly after every
         # widget above, so it can't be clobbered by the widget rebuild
@@ -627,9 +836,24 @@ class Model3DPage(Page):
             except Exception as e:
                 ulog("Model3DPage: start marker draw error: " + type(e).__name__ + " " + str(e))
 
+        if self.dialog == "box_pick" and self.box_pick_start:
+            # marks where the first corner landed -- the only feedback
+            # available between the two clicks (no live outline: that
+            # needs on_move, confirmed not to fire on this hardware)
+            try:
+                fb = hdmi.fb()
+                sx, sy = self._project(self.box_pick_start[0], self.box_pick_start[1],
+                                        self.box_pick_start[2], self._last_scale,
+                                        self._last_origin[0], self._last_origin[1])
+                r = 5
+                self._clipped_line(fb, sx - r, sy, sx + r, sy, RED)
+                self._clipped_line(fb, sx, sy - r, sx, sy + r, RED)
+            except Exception as e:
+                ulog("Model3DPage: box start marker draw error: " + type(e).__name__ + " " + str(e))
+
     def _draw_command_icons(self, icon_slots):
         for name, ix, iy in icon_slots:
-            icon_name = self.ICON_NAMES.get(name)
+            icon_name = ICON_NAMES.get(name)
             if not icon_name:
                 continue
             path = ICONS_DIR + "/" + icon_name + ".bmp"
@@ -640,19 +864,40 @@ class Model3DPage(Page):
 
     # --- scene projection -------------------------------------------
 
+    def _update_rotation_trig(self):
+        # cached once per azimuth/elevation change rather than
+        # recomputed per point -- _raw_project runs for every vertex of
+        # every box/line/circle/arc/grid-dot in a redraw
+        az = math.radians(self.azimuth_deg)
+        el = math.radians(self.elevation_deg)
+        self._rot_ct = math.cos(az)
+        self._rot_st = math.sin(az)
+        self._rot_cp = math.cos(el)
+        self._rot_sp = math.sin(el)
+
     def _raw_project(self, x, y, z):
         # projects at scale=1, origin=(0,0) -- just used to measure
         # extents before the real scale/origin are known. Z is "up" on
-        # screen, matching the usual CAD/3D-printer convention (build
-        # plate is the X-Y plane, height is Z). X goes down-right, Y
-        # down-left, both at 30 degrees (true isometric).
-        sx = (x - y) * self.ISO_COS30
-        sy = (x + y) * self.ISO_SIN30 - z
+        # screen at any azimuth; elevation 0 is edge-on (only Z moves
+        # vertically), elevation 90 is straight down (only X/Y move
+        # vertically, Z is invisible).
+        ct, st, cp, sp = self._rot_ct, self._rot_st, self._rot_cp, self._rot_sp
+        x1 = x * ct - y * st
+        y1 = x * st + y * ct
+        sx = x1
+        sy = y1 * sp - z * cp
         return sx, sy
 
     # which two coordinate indices sweep around a circle/arc in each
     # plane -- the third index stays fixed at the centre's value
     PLANE_AXES = {"XY": (0, 1), "XZ": (0, 2), "YZ": (1, 2)}
+    AXIS_NAMES = {0: "X", 1: "Y", 2: "Z"}
+
+    def _plane_normal_axis(self, plane):
+        # the one coordinate index NOT in PLANE_AXES[plane] -- 0/1/2
+        # sum to 3, so subtracting the two in-plane indices leaves it
+        i, j = self.PLANE_AXES[plane]
+        return 3 - i - j
 
     def _box_corners(self, box):
         c0, c1 = box[0], box[1]
@@ -816,52 +1061,101 @@ class Model3DPage(Page):
             scale, ox, oy = self._compute_transform(pts)
             self._last_scale, self._last_origin = scale, (ox, oy)
             fb = hdmi.fb()
+            # geometry always draws in plain WHITE, selected or not --
+            # confirmed on real hardware that swapping in SELECT_COLOR
+            # here (even RED, otherwise proven to render fine
+            # elsewhere) made the selected item vanish entirely rather
+            # than highlight, and undoing then redoing (which both just
+            # clear self.selected back to None) brought it straight
+            # back. Whatever's actually wrong with that colour swap
+            # isn't worth the risk of ever hiding real geometry again
+            # -- selection now gets a separate, additive marker instead
+            # (_draw_selection_marker)
+            #
+            # BOX is not "the wireframe" -- it stays visible regardless
+            # of WIRE, which only toggles LINE/CIRCLE/ARC
             for bi, box in enumerate(self.boxes):
                 if not self.layer_visible.get(box[2], True):
                     continue
-                colour = self.SELECT_COLOR if self.selected == ("box", bi) else WHITE
                 for p1, p2 in self._box_edges(box):
                     s1 = self._project(p1[0], p1[1], p1[2], scale, ox, oy)
                     s2 = self._project(p2[0], p2[1], p2[2], scale, ox, oy)
-                    self._clipped_line(fb, s1[0], s1[1], s2[0], s2[1], colour)
-            for li, (p0, p1, layer) in enumerate(self.lines):
-                if not self.layer_visible.get(layer, True):
-                    continue
-                colour = self.SELECT_COLOR if self.selected == ("line", li) else WHITE
-                s0 = self._project(p0[0], p0[1], p0[2], scale, ox, oy)
-                s1 = self._project(p1[0], p1[1], p1[2], scale, ox, oy)
-                self._clipped_line(fb, s0[0], s0[1], s1[0], s1[1], colour)
-            for ci, (c, r, plane, layer) in enumerate(self.circles):
-                if not self.layer_visible.get(layer, True):
-                    continue
-                colour = self.SELECT_COLOR if self.selected == ("circle", ci) else WHITE
-                self._draw_arc(fb, c, r, plane, 0, 360, scale, ox, oy, colour=colour)
-            for ai, (c, r, plane, a0, a1, layer) in enumerate(self.arcs):
-                if not self.layer_visible.get(layer, True):
-                    continue
-                colour = self.SELECT_COLOR if self.selected == ("arc", ai) else WHITE
-                self._draw_arc(fb, c, r, plane, a0, a1, scale, ox, oy, colour=colour)
-            if self.grid:
+                    self._clipped_line(fb, s1[0], s1[1], s2[0], s2[1], WHITE)
+            if self.wireframe_visible:
+                for li, (p0, p1, layer) in enumerate(self.lines):
+                    if not self.layer_visible.get(layer, True):
+                        continue
+                    s0 = self._project(p0[0], p0[1], p0[2], scale, ox, oy)
+                    s1 = self._project(p1[0], p1[1], p1[2], scale, ox, oy)
+                    self._clipped_line(fb, s0[0], s0[1], s1[0], s1[1], WHITE)
+                for ci, (c, r, plane, layer) in enumerate(self.circles):
+                    if not self.layer_visible.get(layer, True):
+                        continue
+                    self._draw_arc(fb, c, r, plane, 0, 360, scale, ox, oy, colour=WHITE)
+                for ai, (c, r, plane, a0, a1, layer) in enumerate(self.arcs):
+                    if not self.layer_visible.get(layer, True):
+                        continue
+                    self._draw_arc(fb, c, r, plane, a0, a1, scale, ox, oy, colour=WHITE)
+            self._draw_selection_marker(fb, scale, ox, oy)
+            if self.grid and self.grid_visible:
                 self._draw_grid_dots(fb, scale, ox, oy)
 
             self._draw_axes(g, fb, scale, ox, oy)
         except Exception as e:
             ulog("Model3DPage: scene draw error: " + type(e).__name__ + " " + str(e))
 
+    def _selected_center_point(self):
+        # 3D point to mark for whatever's currently selected -- a
+        # midpoint for box/line, the centre itself for circle/arc
+        if not self.selected:
+            return None
+        kind, idx = self.selected
+        try:
+            if kind == "box":
+                c0, c1 = self.boxes[idx][0], self.boxes[idx][1]
+                return tuple((c0[i] + c1[i]) / 2.0 for i in range(3))
+            if kind == "line":
+                p0, p1 = self.lines[idx][0], self.lines[idx][1]
+                return tuple((p0[i] + p1[i]) / 2.0 for i in range(3))
+            if kind == "circle":
+                return self.circles[idx][0]
+            if kind == "arc":
+                return self.arcs[idx][0]
+        except IndexError:
+            return None
+        return None
+
+    def _draw_selection_marker(self, fb, scale, ox, oy):
+        # additive-only feedback for SELECT -- a crosshair drawn ON TOP
+        # of the (always-WHITE) selected geometry rather than replacing
+        # its colour, so a marker that fails to render for whatever
+        # reason still leaves the geometry itself visible
+        center = self._selected_center_point()
+        if center is None:
+            return
+        mx, my = self._project(center[0], center[1], center[2], scale, ox, oy)
+        r = 8
+        self._clipped_line(fb, mx - r, my, mx + r, my, self.SELECT_COLOR)
+        self._clipped_line(fb, mx, my - r, mx, my + r, self.SELECT_COLOR)
+
     def _draw_grid_dots(self, fb, scale, ox, oy):
         # a dot at every grid intersection in its plane. Grey, not
         # white, so it reads as background reference rather than part
         # of the actual model. Spans 0 to extent (not -extent to
         # +extent) in both plane axes, matching every box/line/circle/
-        # arc's own 0-based convention.
-        plane, spacing, extent = self.grid
+        # arc's own 0-based convention. `position` places the whole
+        # plane along its normal axis (e.g. a "vertical" XZ grid's Y),
+        # so it can line up with an actual wall instead of sitting at 0.
+        plane, spacing, extent, position = self.grid
         i, j = self.PLANE_AXES[plane]
+        k = self._plane_normal_axis(plane)
         n = int(extent / spacing)
         for gi in range(0, n + 1):
             for gj in range(0, n + 1):
                 p = [0.0, 0.0, 0.0]
                 p[i] = gi * spacing
                 p[j] = gj * spacing
+                p[k] = position
                 sx, sy = self._project(p[0], p[1], p[2], scale, ox, oy)
                 if self.CANVAS_X0 <= sx <= self.CANVAS_X1 and self.CANVAS_Y0 <= sy <= self.CANVAS_Y1:
                     ix, iy = int(sx), int(sy)
@@ -886,17 +1180,22 @@ class Model3DPage(Page):
             prev = s
 
     def _draw_axes(self, g, fb, scale, ox, oy):
-        # X/Y/Z reference arrows, one colour each. Each starts past
-        # wherever the model already reaches along that axis (not at
-        # literal (0,0,0)) so it doesn't trace back over -- and cancel
-        # out -- a wireframe edge running the same direction.
+        # X/Y/Z reference arrows, one colour each. When the wireframe
+        # is showing, each starts past wherever the model already
+        # reaches along that axis (not at literal (0,0,0)) so it
+        # doesn't trace back over -- and cancel out -- a wireframe edge
+        # running the same direction. With WIRE off there's no edge to
+        # avoid, so they run the full length from the origin instead --
+        # otherwise, with the model hidden, all that's left on screen is
+        # a short sliver near the tip (or nothing at all, if that
+        # sliver falls outside the canvas).
         length = self._axis_length()
         wing = length * 0.15
         axis_index = {"X": 0, "Y": 1, "Z": 2}
         for axis, d in self.AXIS_DIRS.items():
             perp = self.AXIS_PERP[axis]
             colour = self.AXIS_COLORS[axis]
-            start_at = self._axis_extent(axis_index[axis])
+            start_at = self._axis_extent(axis_index[axis]) if self.wireframe_visible else 0.0
             start3d = (d[0] * start_at, d[1] * start_at, d[2] * start_at)
             tip3d = (d[0] * length, d[1] * length, d[2] * length)
             start = self._project(start3d[0], start3d[1], start3d[2], scale, ox, oy)
@@ -972,12 +1271,35 @@ class Model3DPage(Page):
         g.button(self.DLG_X + 100, y0 + 126, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
 
+    def _build_box_choice_dialog(self, g):
+        h = 180
+        y0 = (480 - h) // 2
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "BOX", fg=WHITE, font=2)
+        g.caption(self.DLG_X + self.DLG_W // 2, y0 + 40, "How do you want to place the corners?",
+                  fg=WHITE, bg=self.BLACK, font=1, just="CT")
+        g.button(self.DLG_X + 20, y0 + 70, 120, 44, "CLICK ON GRID", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_box_choice_click)
+        g.button(self.DLG_X + 180, y0 + 70, 120, 44, "TYPE VALUES", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_box_choice_type)
+        g.button(self.DLG_X + 100, y0 + 126, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_dialog)
+
+    def _grid_snap_title_suffix(self):
+        # every typed X/Y/Z/radius/angle value across every dialog
+        # snaps to this once a GRID is set (see _snap_to_grid) -- shown
+        # in each dialog's own title bar since there's no spare row for
+        # a separate caption in most of them
+        if not self.grid:
+            return " (no grid snap)"
+        return " (snap: %gmm)" % self.grid[1]
+
     def _build_line_dialog(self, g):
         # two-step: START POINT then END POINT, using the same three
         # boxes -- they come up blank each step
         h = 240
         y0 = (480 - h) // 2
         title = "LINE -- START POINT" if self.line_stage == "start" else "LINE -- END POINT"
+        title += self._grid_snap_title_suffix()
         g.frame(self.DLG_X, y0, self.DLG_W, h, title, fg=WHITE, font=2)
 
         labels = ("X (mm):", "Y (mm):", "Z (mm):")
@@ -1003,6 +1325,7 @@ class Model3DPage(Page):
         h = 240
         y0 = (480 - h) // 2
         title = "BOX -- CORNER 1" if self.box_stage == "start" else "BOX -- CORNER 2"
+        title += self._grid_snap_title_suffix()
         g.frame(self.DLG_X, y0, self.DLG_W, h, title, fg=WHITE, font=2)
 
         labels = ("X (mm):", "Y (mm):", "Z (mm):")
@@ -1025,7 +1348,7 @@ class Model3DPage(Page):
     def _build_circle_dialog(self, g):
         h = 300
         y0 = (480 - h) // 2
-        g.frame(self.DLG_X, y0, self.DLG_W, h, "CIRCLE", fg=WHITE, font=2)
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "CIRCLE" + self._grid_snap_title_suffix(), fg=WHITE, font=2)
 
         labels = ("Center X:", "Center Y:", "Center Z:", "Radius:")
         boxes = []
@@ -1048,7 +1371,7 @@ class Model3DPage(Page):
     def _build_arc_dialog(self, g):
         h = 360
         y0 = (480 - h) // 2
-        g.frame(self.DLG_X, y0, self.DLG_W, h, "ARC", fg=WHITE, font=2)
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "ARC" + self._grid_snap_title_suffix(), fg=WHITE, font=2)
 
         labels = ("Center X:", "Center Y:", "Center Z:", "Radius:", "Start (deg):", "End (deg):")
         boxes = []
@@ -1089,7 +1412,7 @@ class Model3DPage(Page):
                  callback=self.on_cancel_dialog)
 
     def _build_grid_dialog(self, g):
-        h = 260
+        h = 304
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "GRID", fg=WHITE, font=2)
 
@@ -1106,9 +1429,97 @@ class Model3DPage(Page):
         g.button(self.DLG_X + 160, ly, 100, 26, self.grid_plane, fg=WHITE, bg=BTN, font=1,
                  callback=self.on_cycle_grid_plane)
 
+        ly += 44
+        # where the grid sits along its plane's normal axis -- e.g. for
+        # an XZ ("vertical") grid, this is its Y position, so it can
+        # line up with an actual wall instead of always sitting at 0
+        axis_name = self.AXIS_NAMES[self._plane_normal_axis(self.grid_plane)]
+        g.caption(self.DLG_X + 20, ly + 6, axis_name + " position (mm):", fg=WHITE, bg=self.BLACK, font=1)
+        self.grid_position_box = g.textbox(self.DLG_X + 160, ly, 100, 26, "0", font=1)
+
         g.button(self.DLG_X + 20, y0 + h - 60, 120, 40, "CREATE", fg=WHITE, bg=BTN, font=2,
                  callback=self.on_confirm_grid)
         g.button(self.DLG_X + 180, y0 + h - 60, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_dialog)
+
+    def _build_extrude_dialog(self, g):
+        # only reachable with something already selected -- see
+        # on_extrude_pressed
+        h = 200
+        y0 = (480 - h) // 2
+        kind = self.selected[0] if self.selected else "?"
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "EXTRUDE " + kind.upper() + self._grid_snap_title_suffix(),
+                fg=WHITE, font=2)
+
+        if kind == "line":
+            label = "Wall height (mm):"
+        elif kind == "box":
+            label = "Add to height (mm):"
+        else:
+            label = "Extrude height (mm):"
+        g.caption(self.DLG_X + 20, y0 + 44, label, fg=WHITE, bg=self.BLACK, font=1)
+        self.extrude_amount_box = g.textbox(self.DLG_X + 20, y0 + 66, 200, 26, "50", font=1)
+
+        g.button(self.DLG_X + 20, y0 + h - 60, 120, 40, "CREATE", fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_confirm_extrude)
+        g.button(self.DLG_X + 180, y0 + h - 60, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_dialog)
+
+    def _edit_fields(self):
+        # (label, current value) pairs for whatever's selected -- the
+        # shared source for both building the dialog's textboxes and
+        # (via defaults, re-derived the same way in on_confirm_edit)
+        # knowing what each typed value means once SAVE is pressed
+        kind, idx = self.selected if self.selected else (None, -1)
+        if kind == "line":
+            p0, p1, layer = self.lines[idx]
+            return [("P1 X:", p0[0]), ("P1 Y:", p0[1]), ("P1 Z:", p0[2]),
+                    ("P2 X:", p1[0]), ("P2 Y:", p1[1]), ("P2 Z:", p1[2])]
+        if kind == "box":
+            c0, c1, layer = self.boxes[idx]
+            return [("Corner1 X:", c0[0]), ("Corner1 Y:", c0[1]), ("Corner1 Z:", c0[2]),
+                    ("Corner2 X:", c1[0]), ("Corner2 Y:", c1[1]), ("Corner2 Z:", c1[2])]
+        if kind == "circle":
+            c, r, plane, layer = self.circles[idx]
+            return [("Center X:", c[0]), ("Center Y:", c[1]), ("Center Z:", c[2]), ("Radius:", r)]
+        if kind == "arc":
+            c, r, plane, a0, a1, layer = self.arcs[idx]
+            return [("Center X:", c[0]), ("Center Y:", c[1]), ("Center Z:", c[2]),
+                    ("Radius:", r), ("Start deg:", a0), ("End deg:", a1)]
+        raise ValueError("unsupported kind")
+
+    def _build_edit_dialog(self, g):
+        # only reachable with something already selected -- see
+        # on_edit_pressed. Fields come pre-filled with the item's
+        # current values so a small mistake (like a bad SELECT/DELETE-
+        # and-redraw, or a mis-snapped point) can be nudged straight
+        # rather than deleted and re-entered from scratch.
+        h = 360
+        y0 = (480 - h) // 2
+        kind = self.selected[0] if self.selected else "?"
+        try:
+            fields = self._edit_fields()
+        except (IndexError, ValueError):
+            g.frame(self.DLG_X, y0, self.DLG_W, h, "EDIT", fg=WHITE, font=2)
+            g.caption(self.DLG_X + self.DLG_W // 2, y0 + 100, "Nothing valid selected",
+                      fg=WHITE, bg=self.BLACK, font=1, just="CT")
+            g.button(self.DLG_X + 100, y0 + h - 60, 120, 40, "CLOSE", fg=WHITE, bg=RED, font=2,
+                     callback=self.on_cancel_dialog)
+            return
+
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "EDIT " + kind.upper() + self._grid_snap_title_suffix(),
+                fg=WHITE, font=2)
+        self.edit_boxes = []
+        for i, (label, default) in enumerate(fields):
+            ly = y0 + 36 + i * 38
+            g.caption(self.DLG_X + 20, ly + 6, label, fg=WHITE, bg=self.BLACK, font=1)
+            self.edit_boxes.append(g.textbox(self.DLG_X + 130, ly, 100, 24, "%g" % default, font=1))
+
+        g.button(self.DLG_X + 20, y0 + h - 96, self.DLG_W - 40, 36, "DELETE THIS ITEM",
+                 fg=WHITE, bg=RED, font=1, callback=self.on_edit_delete)
+        g.button(self.DLG_X + 20, y0 + h - 50, 120, 40, "SAVE", fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_confirm_edit)
+        g.button(self.DLG_X + 180, y0 + h - 50, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
 
     def _build_layers_dialog(self, g):
@@ -1258,9 +1669,10 @@ class Model3DPage(Page):
     def _read_line_point(self):
         def parse(box):
             try:
-                return float(box.value)
+                v = float(box.value)
             except (ValueError, TypeError):
-                return 0.0
+                v = 0.0
+            return self._snap_to_grid(v)
         return (parse(self.line_x_box), parse(self.line_y_box), parse(self.line_z_box))
 
     def on_line_choice_click(self, b):
@@ -1271,6 +1683,16 @@ class Model3DPage(Page):
     def on_line_choice_type(self, b):
         self.line_stage = "start"
         self.dialog = "line"
+        self._redraw()
+
+    def on_box_choice_click(self, b):
+        self.box_pick_start = None
+        self.dialog = "box_pick"
+        self._redraw()
+
+    def on_box_choice_type(self, b):
+        self.box_stage = "start"
+        self.dialog = "box"
         self._redraw()
 
     def on_line_next(self, b):
@@ -1290,9 +1712,10 @@ class Model3DPage(Page):
     def _read_box_point(self):
         def parse(box):
             try:
-                return float(box.value)
+                v = float(box.value)
             except (ValueError, TypeError):
-                return 0.0
+                v = 0.0
+            return self._snap_to_grid(v)
         return (parse(self.box_x_box), parse(self.box_y_box), parse(self.box_z_box))
 
     def on_box_next(self, b):
@@ -1322,20 +1745,41 @@ class Model3DPage(Page):
     def on_confirm_circle(self, b):
         def parse(box, fallback):
             try:
-                return float(box.value)
+                v = float(box.value)
             except (ValueError, TypeError):
-                return fallback
+                v = fallback
+            return self._snap_to_grid(v)
         cx = parse(self.circle_cx_box, 0.0)
         cy = parse(self.circle_cy_box, 0.0)
         cz = parse(self.circle_cz_box, 0.0)
         r = parse(self.circle_r_box, 20.0)
         if r <= 0:
             r = 20.0
+        r = self._snap_length_to_grid(r)
         self._push_undo()
         self.circles.append(((cx, cy, cz), r, self.circle_plane, self.current_layer))
+        for p0, p1 in self._circle_centerline_segments((cx, cy, cz), r, self.circle_plane):
+            self.lines.append((p0, p1, self.current_layer))
         self.dialog = None
         self._redraw()
         self.status_box.value = "CIRCLE: centre (%g,%g,%g) r=%g %s" % (cx, cy, cz, r, self.circle_plane)
+
+    def _circle_centerline_segments(self, center, radius, plane):
+        # a technical-drawing-style center mark -- two short reference
+        # lines through the circle's centre, along the plane's two
+        # axes, extending a little past the circle's own edge so they
+        # read as a crosshair rather than getting lost inside the
+        # circle outline. Added as ordinary lines (own layer tag, own
+        # SELECT/DELETE entry) rather than a special element kind.
+        i, j = self.PLANE_AXES[plane]
+        arm = radius * 1.3
+        p0, p1 = list(center), list(center)
+        p0[i] -= arm
+        p1[i] += arm
+        p2, p3 = list(center), list(center)
+        p2[j] -= arm
+        p3[j] += arm
+        return ((tuple(p0), tuple(p1)), (tuple(p2), tuple(p3)))
 
     def on_cycle_arc_plane(self, b):
         order = ("XY", "XZ", "YZ")
@@ -1345,15 +1789,17 @@ class Model3DPage(Page):
     def on_confirm_arc(self, b):
         def parse(box, fallback):
             try:
-                return float(box.value)
+                v = float(box.value)
             except (ValueError, TypeError):
-                return fallback
+                v = fallback
+            return self._snap_to_grid(v)
         cx = parse(self.arc_cx_box, 0.0)
         cy = parse(self.arc_cy_box, 0.0)
         cz = parse(self.arc_cz_box, 0.0)
         r = parse(self.arc_r_box, 20.0)
         if r <= 0:
             r = 20.0
+        r = self._snap_length_to_grid(r)
         a0 = parse(self.arc_start_box, 0.0)
         a1 = parse(self.arc_end_box, 90.0)
         self._push_undo()
@@ -1372,6 +1818,28 @@ class Model3DPage(Page):
         self.centerline_axis = order[(order.index(self.centerline_axis) + 1) % 3]
         self._redraw()
 
+    def _snap_to_grid(self, value):
+        # rounds any typed number (not a click position -- see
+        # _snap_to_grid_point for that) to the nearest multiple of the
+        # current GRID's spacing, if any -- applied to every numeric
+        # field across every typed-entry dialog (BOX/LINE points,
+        # CIRCLE/ARC centres and radius, ARC's angles, CTR LINE's
+        # length), not just positions
+        if not self.grid or not self.snap_enabled:
+            return value
+        spacing = self.grid[1]
+        if spacing <= 0:
+            return value
+        return round(value / spacing) * spacing
+
+    def _snap_length_to_grid(self, length):
+        # like _snap_to_grid, but guarantees a positive result -- for
+        # lengths/radii, which can't be zero or negative, so it falls
+        # back to one full spacing unit rather than 0 if rounding would
+        # otherwise collapse a short length to nothing
+        snapped = self._snap_to_grid(length)
+        return snapped if snapped > 0 else (self.grid[1] if self.grid else length)
+
     def on_confirm_centerline(self, b):
         try:
             length = float(self.centerline_len_box.value)
@@ -1379,6 +1847,7 @@ class Model3DPage(Page):
                 length = 100.0
         except (ValueError, TypeError):
             length = 100.0
+        length = self._snap_length_to_grid(length)
         d = self.AXIS_DIRS[self.centerline_axis]
         half = length / 2.0
         p0 = (-half * d[0], -half * d[1], -half * d[2])
@@ -1398,6 +1867,11 @@ class Model3DPage(Page):
                 return fallback
         spacing = parse(self.grid_spacing_box, 10.0)
         extent = parse(self.grid_extent_box, 100.0)
+        try:
+            position = float(self.grid_position_box.value)
+        except (ValueError, TypeError):
+            position = 0.0
+        position = self._snap_to_grid(position)
         n = int(extent / spacing)
         self.dialog = None
         if n < 1:
@@ -1414,9 +1888,11 @@ class Model3DPage(Page):
                                       "use a bigger spacing or smaller extent" % (dot_count, self.GRID_MAX_DOTS))
             return
         self._push_undo()
-        self.grid = (self.grid_plane, spacing, extent)
+        self.grid = (self.grid_plane, spacing, extent, position)
         self._redraw()
-        self.status_box.value = "GRID: %s, %g mm spacing, %g mm extent" % (self.grid_plane, spacing, extent)
+        axis_name = self.AXIS_NAMES[self._plane_normal_axis(self.grid_plane)]
+        self.status_box.value = "GRID: %s, %g mm spacing, %g mm extent, %s=%g" % (
+            self.grid_plane, spacing, extent, axis_name, position)
 
     def on_open_layers(self, b):
         self._dialog_selected_layer = self.current_layer
@@ -1459,6 +1935,7 @@ class Model3DPage(Page):
         self.dialog = None
         self.line_stage = "start"
         self.box_stage = "start"
+        self.box_pick_start = None
         self._redraw()
 
     def _make_command_handler(self, name):
@@ -1472,6 +1949,13 @@ class Model3DPage(Page):
             self.line_stage = "start"
         elif name == "BOX":
             self.box_stage = "start"
+            self.box_pick_start = None
+        elif name == "DELETE" and self.selected is not None:
+            # DELETE means "delete the selected item" whenever SELECT
+            # has one highlighted -- only falls back to the saved-file
+            # list below once nothing's currently selected
+            self._delete_selected()
+            return
         target = self.COMMAND_DIALOG.get(name)
         if target is None:
             self._redraw()
@@ -1481,52 +1965,92 @@ class Model3DPage(Page):
         self.dialog = target
         self._redraw()
 
+    def _delete_selected(self):
+        kind, idx = self.selected
+        collection = {"box": self.boxes, "line": self.lines,
+                      "circle": self.circles, "arc": self.arcs}[kind]
+        self._push_undo()
+        del collection[idx]
+        self.selected = None
+        self.dialog = None
+        self._redraw()
+        self.status_box.value = "DELETE: removed %s #%d (undoable)" % (kind.upper(), idx + 1)
+
     def _in_canvas(self, x, y):
         return self.CANVAS_X0 <= x <= self.CANVAS_X1 and self.CANVAS_Y0 <= y <= self.CANVAS_Y1
 
     def _screen_to_plane_point(self, sx, sy, plane):
         # inverts _project(), assuming the point actually lies on
-        # `plane` (the third axis is 0) -- a single 2D screen point
-        # can't otherwise be turned back into a 3D one. Uses whatever
-        # scale/origin the VIEW panel was last drawn with.
+        # `plane` -- a single 2D screen point can't otherwise be turned
+        # back into a 3D one. Uses whatever scale/origin the VIEW panel
+        # was last drawn with. The third axis is 0 by default, unless
+        # the active GRID is on this same plane and has a non-zero
+        # position, in which case the point lands on the grid instead
+        # (matching what's actually drawn -- see _draw_grid_dots).
+        #
+        # Solved generically rather than with a per-plane formula, so
+        # it keeps working at any azimuth/elevation: `plane`'s two
+        # world-space basis vectors are themselves projected (giving
+        # the 2x2 Jacobian from plane-space (a,b) to screen pixels),
+        # then that's inverted to recover (a,b) for this click.
         scale = self._last_scale or 1.0
         ox, oy = self._last_origin
-        rsx = (sx - ox) / scale
-        rsy = (sy - oy) / scale
-        C, S = self.ISO_COS30, self.ISO_SIN30
-        if plane == "XY":
-            x = (rsx / C + rsy / S) / 2.0
-            y = (rsy / S - rsx / C) / 2.0
-            z = 0.0
-        elif plane == "XZ":
-            x = rsx / C
-            z = x * S - rsy
-            y = 0.0
-        else:  # YZ
-            y = -rsx / C
-            z = y * S - rsy
-            x = 0.0
-        return (x, y, z)
+        normal_offset = 0.0
+        if self.grid and self.grid[0] == plane:
+            normal_offset = self.grid[3]
+        offset_x = offset_y = 0.0
+        if normal_offset:
+            k = self._plane_normal_axis(plane)
+            off_vec = [0.0, 0.0, 0.0]
+            off_vec[k] = normal_offset
+            offset_x, offset_y = self._raw_project(off_vec[0], off_vec[1], off_vec[2])
+        rsx = (sx - ox) / scale - offset_x
+        rsy = (sy - oy) / scale - offset_y
+        u, v = self.PLANE_BASIS[plane]
+        ux, uy = self._raw_project(u[0], u[1], u[2])
+        vx, vy = self._raw_project(v[0], v[1], v[2])
+        det = ux * vy - vx * uy
+        if -1e-9 < det < 1e-9:
+            # near edge-on view of this plane at the current rotation --
+            # nudge off zero rather than divide by it; the result will
+            # be a poor (likely large) estimate, but GRID snapping
+            # clamps it back into range rather than blowing up
+            det = 1e-9 if det >= 0 else -1e-9
+        a = (rsx * vy - vx * rsy) / det
+        b = (ux * rsy - rsx * uy) / det
+        p = [0.0, 0.0, 0.0]
+        for coeff, vec in ((a, u), (b, v)):
+            for i in range(3):
+                p[i] += coeff * vec[i]
+        if normal_offset:
+            p[self._plane_normal_axis(plane)] = normal_offset
+        return (p[0], p[1], p[2])
 
     def _snap_to_grid_point(self, point):
-        if not self.grid:
+        if not self.grid or not self.snap_enabled:
             return point
-        plane, spacing, extent = self.grid
+        plane, spacing, extent, position = self.grid
         i, j = self.PLANE_AXES[plane]
+        k = self._plane_normal_axis(plane)
         p = list(point)
         for idx in (i, j):
             v = round(p[idx] / spacing) * spacing
             p[idx] = max(0.0, min(extent, v))
+        p[k] = position
         return (p[0], p[1], p[2])
 
     def _point_to_segment_dist(self, px, py, x0, y0, x1, y1):
+        # math.sqrt, not math.hypot -- confirmed on real hardware that
+        # this board's MicroPython math module doesn't implement hypot
         dx, dy = x1 - x0, y1 - y0
         if dx == 0 and dy == 0:
-            return math.hypot(px - x0, py - y0)
+            ex, ey = px - x0, py - y0
+            return math.sqrt(ex * ex + ey * ey)
         t = ((px - x0) * dx + (py - y0) * dy) / (dx * dx + dy * dy)
         t = max(0.0, min(1.0, t))
         cx, cy = x0 + t * dx, y0 + t * dy
-        return math.hypot(px - cx, py - cy)
+        ex, ey = px - cx, py - cy
+        return math.sqrt(ex * ex + ey * ey)
 
     def _arc_hit_dist(self, x, y, center, radius, plane, a0, a1, scale, ox, oy, segments=32):
         # same chord approximation _draw_arc uses -- distance from
@@ -1613,17 +2137,20 @@ class Model3DPage(Page):
         # g.on_touch(callback) fires with integer (x, y) screen
         # coordinates on any click/tap. Only registered while the main
         # panel (not a dialog) is showing -- see _build_main.
+        self.touch_count += 1
+        ulog("on_touch fired #%d at (%d,%d) dialog=%s" % (self.touch_count, x, y, self.dialog))
         if self.dialog == "line_pick":
             self._on_line_pick_touch(x, y)
             return
         if self.dialog == "select_pick":
             self._on_select_pick_touch(x, y)
             return
+        if self.dialog == "box_pick":
+            self._on_box_pick_touch(x, y)
+            return
         #
-        # DRAG CAVEAT: a genuine continuous mouse-move/hover hook
-        # (on_move) is not used here -- it wasn't reliable on the
-        # hardware this was built/tested on -- so panning is
-        # reconstructed from on_touch instead: two clicks inside the
+        # DRAG CAVEAT: panning is reconstructed from on_touch rather
+        # than a continuous drag hook: two clicks inside the
         # VIEW canvas within DRAG_TIMEOUT_MS of each other are treated
         # as a drag, and the view pans by the difference between them.
         # Whether this feels like a smooth drag depends on whether
@@ -1651,10 +2178,11 @@ class Model3DPage(Page):
 
     def _safe_position_readout(self, x, y):
         try:
-            return self._position_readout(x, y)
+            text = self._position_readout(x, y)
         except Exception as e:
             ulog("Model3DPage: position readout error: " + type(e).__name__ + " " + str(e))
-            return "Mouse: (%d, %d)" % (x, y)
+            text = "Mouse: (%d, %d)" % (x, y)
+        return "T:%d  " % self.touch_count + text
 
     def _on_line_pick_touch(self, x, y):
         # LINE's "CLICK ON GRID" mode -- two clicks in the canvas set
@@ -1662,19 +2190,21 @@ class Model3DPage(Page):
         # on_touch drag caveat above). Every branch here updates
         # status_box directly so a click's outcome is visible on
         # screen immediately.
+        tag = "T:%d  " % self.touch_count
         if not self._in_canvas(x, y):
-            self.status_box.value = "LINE: click (%d,%d) was outside the VIEW panel" % (x, y)
+            self.status_box.value = tag + "LINE: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
         try:
             plane, point = self._plane_point_at(x, y)
         except Exception as e:
-            self.status_box.value = "LINE pick error: " + type(e).__name__ + " " + str(e)
+            self.status_box.value = tag + "LINE pick error: " + type(e).__name__ + " " + str(e)
             ulog("Model3DPage: line pick error: " + type(e).__name__ + " " + str(e))
             return
         if self.line_stage == "start":
             self.line_start_point = point
             self.line_stage = "end"
             self._redraw()
+            self.status_box.value = tag + "LINE: start point set, click END point"
         else:
             self._push_undo()
             self.lines.append((self.line_start_point, point, self.current_layer))
@@ -1683,26 +2213,58 @@ class Model3DPage(Page):
             self.dialog = None
             self.line_stage = "start"
             self._redraw()
-            self.status_box.value = "LINE: %s to %s" % (start_point, end_point)
+            self.status_box.value = tag + "LINE: %s to %s" % (start_point, end_point)
+
+    def _on_box_pick_touch(self, x, y):
+        # BOX's "CLICK ON GRID" mode -- mirrors _on_line_pick_touch:
+        # first click sets one corner, second click sets the opposite
+        # corner and creates the box (on_box_create already sorts
+        # whichever two corners come in into min/max order)
+        tag = "T:%d  " % self.touch_count
+        if not self._in_canvas(x, y):
+            self.status_box.value = tag + "BOX: click (%d,%d) was outside the VIEW panel" % (x, y)
+            return
+        try:
+            plane, point = self._plane_point_at(x, y)
+        except Exception as e:
+            self.status_box.value = tag + "BOX pick error: " + type(e).__name__ + " " + str(e)
+            ulog("Model3DPage: box pick error: " + type(e).__name__ + " " + str(e))
+            return
+        if self.box_pick_start is None:
+            self.box_pick_start = point
+            self._redraw()
+            self.status_box.value = tag + "BOX: first corner set, click the OPPOSITE corner"
+        else:
+            p1, p2 = self.box_pick_start, point
+            corner_min = (min(p1[0], p2[0]), min(p1[1], p2[1]), min(p1[2], p2[2]))
+            corner_max = (max(p1[0], p2[0]), max(p1[1], p2[1]), max(p1[2], p2[2]))
+            self._push_undo()
+            self.boxes.append((corner_min, corner_max, self.current_layer))
+            self.dialog = None
+            self.box_pick_start = None
+            self._redraw()
+            self.status_box.value = tag + "BOX: %s to %s" % (corner_min, corner_max)
 
     def _on_select_pick_touch(self, x, y):
+        tag = "T:%d  " % self.touch_count
         if not self._in_canvas(x, y):
-            self.status_box.value = "SELECT: click (%d,%d) was outside the VIEW panel" % (x, y)
+            self.status_box.value = tag + "SELECT: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
         try:
             hit = self._hit_test(x, y)
         except Exception as e:
-            self.status_box.value = "SELECT error: " + type(e).__name__ + " " + str(e)
+            self.status_box.value = tag + "SELECT error: " + type(e).__name__ + " " + str(e)
             ulog("Model3DPage: select error: " + type(e).__name__ + " " + str(e))
             return
         self.selected = hit
+        ulog("Model3DPage: SELECT hit=%s at click (%d,%d)" % (str(hit), x, y))
         self.dialog = None
         self._redraw()
         if hit:
             kind, idx = hit
-            self.status_box.value = "SELECTED: %s #%d" % (kind.upper(), idx + 1)
+            self.status_box.value = tag + "SELECTED: %s #%d" % (kind.upper(), idx + 1)
         else:
-            self.status_box.value = "SELECT: nothing close enough -- try clicking nearer an item"
+            self.status_box.value = tag + "SELECT: nothing close enough -- try clicking nearer an item"
 
     def on_zoom_in(self, b):
         self.zoom = min(self.zoom * self.ZOOM_STEP, self.MAX_ZOOM)
@@ -1716,6 +2278,188 @@ class Model3DPage(Page):
         self.zoom = 1.0
         self.pan_x = 0.0
         self.pan_y = 0.0
+        self.azimuth_deg = self.AZIMUTH_DEFAULT
+        self.elevation_deg = self.ELEVATION_DEFAULT
+        self._update_rotation_trig()
+        self._redraw()
+
+    def on_rotate_az_minus(self, b):
+        self.azimuth_deg = (self.azimuth_deg - self.AZIMUTH_STEP) % 360.0
+        self._update_rotation_trig()
+        self._redraw()
+
+    def on_rotate_az_plus(self, b):
+        self.azimuth_deg = (self.azimuth_deg + self.AZIMUTH_STEP) % 360.0
+        self._update_rotation_trig()
+        self._redraw()
+
+    def on_rotate_el_minus(self, b):
+        self.elevation_deg = max(self.ELEVATION_MIN, self.elevation_deg - self.ELEVATION_STEP)
+        self._update_rotation_trig()
+        self._redraw()
+
+    def on_rotate_el_plus(self, b):
+        self.elevation_deg = min(self.ELEVATION_MAX, self.elevation_deg + self.ELEVATION_STEP)
+        self._update_rotation_trig()
+        self._redraw()
+
+    def on_toggle_wireframe(self, b):
+        self.wireframe_visible = not self.wireframe_visible
+        self._redraw()
+
+    def on_toggle_grid_visible(self, b):
+        self.grid_visible = not self.grid_visible
+        self._redraw()
+
+    def on_toggle_snap(self, b):
+        self.snap_enabled = not self.snap_enabled
+        self._redraw()
+
+    def on_extrude_pressed(self, b):
+        if self.selected is None:
+            self.status_box.value = "EXTRUDE: SELECT an item first"
+            return
+        self.active_command = "EXTRUDE"
+        self.dialog = "extrude"
+        self._redraw()
+
+    def on_confirm_extrude(self, b):
+        self.dialog = None
+        if self.selected is None:
+            self._redraw()
+            self.status_box.value = "EXTRUDE: nothing selected"
+            return
+        kind, idx = self.selected
+        try:
+            amount = float(self.extrude_amount_box.value)
+        except (ValueError, TypeError):
+            amount = 0.0
+        if amount <= 0:
+            amount = 50.0
+        amount = self._snap_length_to_grid(amount)
+        try:
+            if kind == "line":
+                p0, p1, layer = self.lines[idx]
+            elif kind == "box":
+                c0, c1, layer = self.boxes[idx]
+            elif kind == "circle":
+                center, radius, plane, layer = self.circles[idx]
+            else:
+                center, radius, plane, a0, a1, layer = self.arcs[idx]
+        except IndexError:
+            self._redraw()
+            self.status_box.value = "EXTRUDE: that item no longer exists"
+            return
+        self._push_undo()
+        if kind == "line":
+            # turns a line into a rectangular wall outline: the
+            # original line stays as the bottom edge, a copy raised by
+            # `amount` in Z becomes the top edge, plus two verticals
+            # closing the ends -- all ordinary LINE entries, no new
+            # element kind needed
+            top0 = (p0[0], p0[1], p0[2] + amount)
+            top1 = (p1[0], p1[1], p1[2] + amount)
+            self.lines.append((top0, top1, layer))
+            self.lines.append((p0, top0, layer))
+            self.lines.append((p1, top1, layer))
+            self.status_box.value = "EXTRUDE: line raised into a %gmm wall" % amount
+        elif kind == "box":
+            self.boxes[idx] = (c0, (c1[0], c1[1], c1[2] + amount), layer)
+            self.status_box.value = "EXTRUDE: box height increased by %gmm" % amount
+        elif kind == "circle":
+            # sweeps the circle along its plane's normal axis into a
+            # cylinder outline: the original stays as the bottom
+            # circle, a copy offset by `amount` becomes the top circle,
+            # with a few verticals connecting them -- all ordinary
+            # CIRCLE/LINE entries, no new element kind needed
+            axis = self._plane_normal_axis(plane)
+            top_center = list(center)
+            top_center[axis] += amount
+            top_center = tuple(top_center)
+            self.circles.append((top_center, radius, plane, layer))
+            for angle in (0, 90, 180, 270):
+                pb = self._circle_point(center, radius, plane, angle)
+                pt = self._circle_point(top_center, radius, plane, angle)
+                self.lines.append((pb, pt, layer))
+            self.status_box.value = "EXTRUDE: circle swept into a %gmm cylinder" % amount
+        else:
+            # same idea as circle, but only the two ends of the arc get
+            # a connecting vertical, matching a LINE's wall ends
+            axis = self._plane_normal_axis(plane)
+            top_center = list(center)
+            top_center[axis] += amount
+            top_center = tuple(top_center)
+            self.arcs.append((top_center, radius, plane, a0, a1, layer))
+            for angle in (a0, a1):
+                pb = self._circle_point(center, radius, plane, angle)
+                pt = self._circle_point(top_center, radius, plane, angle)
+                self.lines.append((pb, pt, layer))
+            self.status_box.value = "EXTRUDE: arc swept into a %gmm curved wall" % amount
+        self.selected = None
+        self._redraw()
+
+    def on_edit_pressed(self, b):
+        if self.selected is None:
+            self.status_box.value = "EDIT: SELECT an item first"
+            return
+        self.active_command = "EDIT"
+        self.dialog = "edit"
+        self._redraw()
+
+    def on_edit_delete(self, b):
+        if self.selected is None:
+            self.dialog = None
+            self._redraw()
+            self.status_box.value = "EDIT: nothing selected"
+            return
+        self._delete_selected()
+
+    def on_confirm_edit(self, b):
+        self.dialog = None
+        if self.selected is None:
+            self._redraw()
+            self.status_box.value = "EDIT: nothing selected"
+            return
+        kind, idx = self.selected
+
+        def parse(box, fallback):
+            try:
+                v = float(box.value)
+            except (ValueError, TypeError):
+                v = fallback
+            return self._snap_to_grid(v)
+
+        try:
+            fields = self._edit_fields()
+        except (IndexError, ValueError):
+            self._redraw()
+            self.status_box.value = "EDIT: that item no longer exists"
+            return
+        values = [parse(box, default) for box, (label, default) in zip(self.edit_boxes, fields)]
+
+        self._push_undo()
+        if kind == "line":
+            layer = self.lines[idx][2]
+            self.lines[idx] = ((values[0], values[1], values[2]), (values[3], values[4], values[5]), layer)
+            self.status_box.value = "EDIT: LINE #%d updated" % (idx + 1)
+        elif kind == "box":
+            layer = self.boxes[idx][2]
+            p0 = (values[0], values[1], values[2])
+            p1 = (values[3], values[4], values[5])
+            corner_min = (min(p0[0], p1[0]), min(p0[1], p1[1]), min(p0[2], p1[2]))
+            corner_max = (max(p0[0], p1[0]), max(p0[1], p1[1]), max(p0[2], p1[2]))
+            self.boxes[idx] = (corner_min, corner_max, layer)
+            self.status_box.value = "EDIT: BOX #%d updated" % (idx + 1)
+        elif kind == "circle":
+            _, old_r, plane, layer = self.circles[idx]
+            r = self._snap_length_to_grid(values[3] if values[3] > 0 else old_r)
+            self.circles[idx] = ((values[0], values[1], values[2]), r, plane, layer)
+            self.status_box.value = "EDIT: CIRCLE #%d updated" % (idx + 1)
+        else:  # arc
+            _, old_r, plane, old_a0, old_a1, layer = self.arcs[idx]
+            r = self._snap_length_to_grid(values[3] if values[3] > 0 else old_r)
+            self.arcs[idx] = ((values[0], values[1], values[2]), r, plane, values[4], values[5], layer)
+            self.status_box.value = "EDIT: ARC #%d updated" % (idx + 1)
         self._redraw()
 
     def _model_snapshot(self):
@@ -1741,6 +2485,11 @@ class Model3DPage(Page):
             return
         self.redo_stack.append(self._model_snapshot())
         self._restore_snapshot(self.undo_stack.pop())
+        # self.selected is a (kind, index) pair into boxes/lines/
+        # circles/arcs -- snapshots don't carry selection, so that
+        # index can easily point at a different item (or nothing) once
+        # the lists it indexes into have just changed underneath it
+        self.selected = None
         self._redraw()
         self.status_box.value = "Undone"
 
@@ -1750,6 +2499,7 @@ class Model3DPage(Page):
             return
         self.undo_stack.append(self._model_snapshot())
         self._restore_snapshot(self.redo_stack.pop())
+        self.selected = None
         self._redraw()
         self.status_box.value = "Redone"
 
