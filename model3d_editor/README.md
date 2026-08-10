@@ -5,8 +5,8 @@ from a larger car-club management program so it can be shared and run
 on its own.
 
 Draw boxes, lines, circles, and arcs on named layers; view them as a
-live isometric wireframe with pan/zoom and undo/redo; save/load named
-models to the SD card.
+live wireframe -- rotatable, zoomable/pannable, and hideable -- with
+undo/redo; save/load named models to the SD card.
 
 ## Requirements
 
@@ -30,9 +30,15 @@ Models are saved as plain text under `/sd/models/*.model`.
 
 ## Notes
 
-- Input is click/tap based (`on_touch`) rather than continuous
-  mouse-move — this board's continuous-hover hook wasn't reliable, so
-  panning is nudged with on-screen U/D/L/R buttons instead of dragged.
+- Input is click/tap based (`on_touch`) only — confirmed on real
+  hardware to be the sole interactive input method `pcgui.GUI` actually
+  invokes. `dir(pcgui.GUI)` shows no `on_wheel`/`on_scroll` method at
+  all, and while `on_move` exists as a plain instance attribute
+  (assigning it doesn't error), doing so made no observable difference
+  on real hardware -- the mouse position readout stayed silent between
+  clicks either way, so nothing calls it. Panning is nudged with
+  on-screen U/D/L/R buttons instead of dragged, there's no mouse-wheel
+  zoom, and the mouse position readout only updates on each click.
 - Layers are organisational groups (show/hide, tag elements), not
   Z-height slicing.
 - GRID is capped at 500 dots to avoid a very fine spacing/large extent
