@@ -29,6 +29,7 @@
 import gc
 import os
 import math
+import struct
 import time
 import hdmi
 import pcgui
@@ -109,10 +110,14 @@ def _fb_line(fb, x0, y0, x1, y1, color):
 #   LINE x0 y0 z0 x1 y1 z1 layer       -- endpoints
 #   CIRCLE cx cy cz radius plane layer -- plane is XY/XZ/YZ
 #   ARC cx cy cz radius plane start end layer  -- start/end in degrees
-#   GRID plane spacing extent [position]  -- at most one per file, no
-#     layer; position is where the grid sits along its plane's normal
-#     axis (Z for XY, Y for XZ, X for YZ) -- omitted/missing means 0,
-#     for files saved before this field existed
+#   GRID plane spacing extent_i extent_j [position]  -- at most one per
+#     file, no layer; extent_i/extent_j are along the plane's two axes
+#     in AXIS_NAMES order (e.g. X then Y for an XY grid), independent
+#     so a grid can exactly cover a non-square face; position is where
+#     the grid sits along its plane's normal axis (Z for XY, Y for XZ,
+#     X for YZ) -- omitted/missing means 0, for files saved before that
+#     field existed. Files saved before extent_i/extent_j existed have
+#     just one extent value, applied to both axes (a square grid).
 #   LAYER name visible           -- visible is 1 or 0, one per layer
 def serialize_model(boxes, lines, circles, arcs, grid, layers, layer_visible):
     out = []
@@ -125,8 +130,8 @@ def serialize_model(boxes, lines, circles, arcs, grid, layers, layer_visible):
     for (c, r, plane, a0, a1, layer) in arcs:
         out.append("ARC %g %g %g %g %s %g %g %s" % (c[0], c[1], c[2], r, plane, a0, a1, layer))
     if grid:
-        plane, spacing, extent, position = grid
-        out.append("GRID %s %g %g %g" % (plane, spacing, extent, position))
+        plane, spacing, extent_i, extent_j, position = grid
+        out.append("GRID %s %g %g %g %g" % (plane, spacing, extent_i, extent_j, position))
     for name in layers:
         out.append("LAYER %s %d" % (name, 1 if layer_visible.get(name, True) else 0))
     return "\n".join(out) + "\n"
@@ -167,10 +172,13 @@ def parse_model(text):
         elif parts[0] == "ARC" and len(parts) >= 8:
             arcs.append(((float(parts[1]), float(parts[2]), float(parts[3])),
                          float(parts[4]), parts[5], float(parts[6]), float(parts[7]), "Layer1"))
+        elif parts[0] == "GRID" and len(parts) >= 6:
+            grid = (parts[1], float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5]))
         elif parts[0] == "GRID" and len(parts) >= 5:
-            grid = (parts[1], float(parts[2]), float(parts[3]), float(parts[4]))
+            # pre-independent-extents save: one extent, applied to both axes
+            grid = (parts[1], float(parts[2]), float(parts[3]), float(parts[3]), float(parts[4]))
         elif parts[0] == "GRID" and len(parts) >= 4:
-            grid = (parts[1], float(parts[2]), float(parts[3]), 0.0)
+            grid = (parts[1], float(parts[2]), float(parts[3]), float(parts[3]), 0.0)
         elif parts[0] == "LAYER" and len(parts) >= 3:
             layers.append(parts[1])
             layer_visible[parts[1]] = parts[2] != "0"
@@ -219,6 +227,247 @@ def delete_model_file(name):
         return True
     except OSError:
         return False
+
+
+# --- template wireframes: a reference cube (dots on its XY/XZ/YZ faces
+# through the origin, plus optional centre lines) that's independent of
+# whatever model is currently open -- unaffected by NEW FILE/OPEN, not
+# saved into any .model file. Named and saved like models are, so you
+# can build up a small library (e.g. a big reference cube and a small
+# one for detail work) and pick up to two of them -- MAIN and LOCAL --
+# to show at once. Each saved as one line:
+#   size spacing scale centerlines show_xy show_xz show_yz
+# size/spacing are the base values; scale multiplies both together, so
+# the same saved template can be reused at any real-world size.
+WIREFRAMES_DIR = "/sd/wireframes"
+TEMPLATE_ACTIVE_FILE = "/sd/template_active.txt"
+
+
+def serialize_wireframe(cfg):
+    size, spacing, scale, centerlines, show_xy, show_xz, show_yz = cfg
+    return "%g %g %g %d %d %d %d\n" % (
+        size, spacing, scale, 1 if centerlines else 0,
+        1 if show_xy else 0, 1 if show_xz else 0, 1 if show_yz else 0)
+
+
+def parse_wireframe(text):
+    parts = text.split()
+    if len(parts) < 7:
+        return None
+    try:
+        return (float(parts[0]), float(parts[1]), float(parts[2]), parts[3] != "0",
+                parts[4] != "0", parts[5] != "0", parts[6] != "0")
+    except ValueError:
+        return None
+
+
+def save_wireframe_file(name, cfg):
+    try:
+        os.mkdir(WIREFRAMES_DIR)
+    except OSError:
+        pass  # already exists
+    path = WIREFRAMES_DIR + "/" + name + ".wf"
+    f = open(path, "w")
+    try:
+        f.write(serialize_wireframe(cfg))
+    finally:
+        f.close()
+    return path
+
+
+def load_wireframe_file(name):
+    path = WIREFRAMES_DIR + "/" + name + ".wf"
+    f = open(path)
+    try:
+        text = f.read()
+    finally:
+        f.close()
+    return parse_wireframe(text)
+
+
+def list_saved_wireframes():
+    try:
+        names = [f[:-3] for f in os.listdir(WIREFRAMES_DIR) if f.endswith(".wf")]
+        names.sort()
+        return names
+    except OSError:
+        return []
+
+
+def delete_wireframe_file(name):
+    try:
+        os.remove(WIREFRAMES_DIR + "/" + name + ".wf")
+        return True
+    except OSError:
+        return False
+
+
+def load_template_active():
+    # returns (main_name, local_name), either/both None if unset
+    try:
+        f = open(TEMPLATE_ACTIVE_FILE)
+        try:
+            text = f.read()
+        finally:
+            f.close()
+    except OSError:
+        return None, None
+    main_name = None
+    local_name = None
+    for line in text.split("\n"):
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            if parts[0] == "MAIN":
+                main_name = parts[1]
+            elif parts[0] == "LOCAL":
+                local_name = parts[1]
+    return main_name, local_name
+
+
+def save_template_active(main_name, local_name):
+    lines = []
+    if main_name:
+        lines.append("MAIN " + main_name)
+    if local_name:
+        lines.append("LOCAL " + local_name)
+    try:
+        f = open(TEMPLATE_ACTIVE_FILE, "w")
+        try:
+            f.write("\n".join(lines) + ("\n" if lines else ""))
+        finally:
+            f.close()
+    except OSError as e:
+        ulog("save_template_active failed: " + str(e))
+
+
+# --- STL export: the model is a wireframe (edges only), but STL needs
+# a solid triangle mesh -- BOX converts directly (it's already a solid
+# box), LINE/CIRCLE/ARC don't have any volume of their own, so each
+# gets "solidified" into a thin rectangular strut/tube of a chosen
+# thickness (a circle/arc becomes a ring of straight struts, reusing
+# the same chord approximation _draw_arc already uses on screen, so
+# what you see is what gets printed). Adjacent struts around a circle/
+# arc don't perfectly weld at their shared joints (each is its own
+# independent oblique box) -- fine for FDM printing, where slicers
+# routinely repair much worse, but worth knowing if a strict mesh
+# checker complains. Written as binary STL (compact, simple format).
+def _v_sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def _v_add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def _v_scale(a, s):
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+
+def _v_cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _v_length(a):
+    return math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+
+
+def _v_normalize(a):
+    length = _v_length(a)
+    if length < 1e-9:
+        return (0.0, 0.0, 1.0)
+    return (a[0] / length, a[1] / length, a[2] / length)
+
+
+def _perp_basis(d):
+    # d must already be a unit vector -- returns (u, v) such that
+    # u, v, d form a right-handed orthonormal basis (cross(u, v) == d),
+    # the same convention as cross(X_AXIS, Y_AXIS) == Z_AXIS
+    ref = (1.0, 0.0, 0.0) if abs(d[0]) < 0.9 else (0.0, 1.0, 0.0)
+    u = _v_normalize(_v_cross(ref, d))
+    v = _v_cross(d, u)
+    return u, v
+
+
+def _box_corner_triangles(b0, b1, b2, b3, t0, t1, t2, t3):
+    # 12 triangles (2 per face) for a box given its 4 bottom corners
+    # (in order, forming a right-handed ring when viewed from "outside
+    # the top") and the matching 4 top corners directly above them.
+    # Winding is chosen so every face's normal points outward.
+    tris = []
+
+    def quad(p0, p1, p2, p3):
+        tris.append((p0, p1, p2))
+        tris.append((p0, p2, p3))
+    quad(b3, b2, b1, b0)
+    quad(t0, t1, t2, t3)
+    quad(b0, b1, t1, t0)
+    quad(b1, b2, t2, t1)
+    quad(b2, b3, t3, t2)
+    quad(b3, b0, t0, t3)
+    return tris
+
+
+def _box_triangles(c0, c1):
+    x0, y0, z0 = c0
+    x1, y1, z1 = c1
+    b0, b1, b2, b3 = (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0)
+    t0, t1, t2, t3 = (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1)
+    return _box_corner_triangles(b0, b1, b2, b3, t0, t1, t2, t3)
+
+
+def _strut_triangles(p0, p1, half_width):
+    # a thin rectangular beam (square cross-section) running from p0
+    # to p1 -- how LINE/CIRCLE/ARC edges get turned into something
+    # with actual volume for printing (see the module comment above)
+    d = _v_sub(p1, p0)
+    if _v_length(d) < 1e-6:
+        return []
+    d = _v_normalize(d)
+    u, v = _perp_basis(d)
+    hu, hv = _v_scale(u, half_width), _v_scale(v, half_width)
+    b0 = _v_sub(_v_sub(p0, hu), hv)
+    b1 = _v_sub(_v_add(p0, hu), hv)
+    b2 = _v_add(_v_add(p0, hu), hv)
+    b3 = _v_add(_v_sub(p0, hu), hv)
+    offset = _v_sub(p1, p0)
+    t0, t1, t2, t3 = _v_add(b0, offset), _v_add(b1, offset), _v_add(b2, offset), _v_add(b3, offset)
+    return _box_corner_triangles(b0, b1, b2, b3, t0, t1, t2, t3)
+
+
+def _triangle_normal(p0, p1, p2):
+    return _v_normalize(_v_cross(_v_sub(p1, p0), _v_sub(p2, p0)))
+
+
+STL_DIR = "/sd/stl"
+
+
+def write_stl_file(path, triangles):
+    f = open(path, "wb")
+    try:
+        header = b"model3d_editor STL export"
+        f.write(header + b"\x00" * (80 - len(header)))
+        f.write(struct.pack("<I", len(triangles)))
+        for (p0, p1, p2) in triangles:
+            n = _triangle_normal(p0, p1, p2)
+            f.write(struct.pack("<3f", n[0], n[1], n[2]))
+            f.write(struct.pack("<3f", p0[0], p0[1], p0[2]))
+            f.write(struct.pack("<3f", p1[0], p1[1], p1[2]))
+            f.write(struct.pack("<3f", p2[0], p2[1], p2[2]))
+            f.write(struct.pack("<H", 0))
+    finally:
+        f.close()
+
+
+def save_stl_file(name, triangles):
+    try:
+        os.mkdir(STL_DIR)
+    except OSError:
+        pass  # already exists
+    path = STL_DIR + "/" + name + ".stl"
+    write_stl_file(path, triangles)
+    return path
 
 
 # command name -> icon file under ICONS_DIR (see assets/icons/*.svg in
@@ -436,7 +685,7 @@ class Model3DPage(Page):
     # to keep fitting more buttons in the same panel height as they've
     # been added.
     COMMANDS = ("NEW FILE", "OPEN", "SAVE AS", "DELETE", "SELECT", "LINE", "CTR LINE",
-                "BOX", "CIRCLE", "ARC", "GRID")
+                "BOX", "CIRCLE", "ARC", "GRID", "TEMPLATE")
     CMD_BTN_H = 26  # shrunk again (30->26, icons 22->18px) to fit SELECT as an 11th button
     CMD_BTN_GAP = 5
 
@@ -467,7 +716,7 @@ class Model3DPage(Page):
     ZOOM_OUT_X = ZOOM_IN_X - 4 - ZOOM_BTN_W
     ZOOM_STEP = 1.2
     MIN_ZOOM = 0.2
-    MAX_ZOOM = 5.0
+    MAX_ZOOM = 20.0  # raised from 5.0 -- 5x wasn't enough to work on a small part of a larger model
 
     # undo/redo, directly below the zoom row -- edit controls, not
     # drawing tools, so (like zoom) no CONFIRM popup for these
@@ -591,6 +840,7 @@ class Model3DPage(Page):
     # and is already proven to draw via this exact framebuffer path
     # (the dashed active-command frame, the LINE start-point marker).
     SELECT_COLOR = RED
+    CIRCLE_PREVIEW_COLOR = 0xFFFF00  # yellow -- distinct from SELECT_COLOR/grid grey/geometry white
     SELECT_THRESHOLD = 15    # px -- closest hit within this radius wins
 
     def __init__(self):
@@ -600,6 +850,7 @@ class Model3DPage(Page):
         self.dialog = None        # None, "newfile", "open", "saveas", "delete", "line",
                                    # "box", "circle", or "arc"
         self.model_name = "mycar"
+        self.stl_strut_thickness = 4.0  # mm -- default cross-section for solidified LINE/CIRCLE/ARC edges
         self.boxes = []             # list of ((x0,y0,z0), (x1,y1,z1)) opposite corners
         self.lines = []             # list of ((x0,y0,z0), (x1,y1,z1)) segments
         self.circles = []           # list of ((cx,cy,cz), radius, plane)
@@ -610,10 +861,15 @@ class Model3DPage(Page):
         self.box_start_point = None
         self.box_stage = "start"   # "start" or "end", within the BOX dialog
         self.circle_plane = "XY"   # cycles XY -> XZ -> YZ, within the CIRCLE dialog
+        self._circle_radius_pending = None  # typed radius, preserved across a same-dialog redraw
+        self._circle_pick_radius = 20.0     # confirmed radius, used once CIRCLE switches to click-to-place
+        self._axis_label_widgets = []  # g.caption() widgets from the last _draw_axes call -- removed
+                                        # before creating new ones so repeated lightweight _draw_scene()
+                                        # calls (e.g. live mouse polling) don't pile up stale duplicates
         self.arc_plane = "XY"      # same, within the ARC dialog
         self.grid_plane = "XY"     # same, within the GRID dialog
-        self.grid = None          # (plane, spacing, extent, position) or None -- one grid at a time,
-                                   # a fresh GRID replaces whatever grid was already there
+        self.grid = None          # (plane, spacing, extent_i, extent_j, position) or None -- one
+                                   # grid at a time, a fresh GRID replaces whatever grid was there
         self.snap_enabled = True  # master switch -- grid snapping only actually applies
                                    # when this is True AND self.grid is set
         self.centerline_axis = "X"  # cycles X -> Y -> Z, within the CTR LINE dialog
@@ -626,6 +882,7 @@ class Model3DPage(Page):
         self.current_layer = "Layer1"
         self.layer_visible = {"Layer1": True}
         self._dialog_selected_layer = None
+        self._layers_dialog_message = ""  # feedback shown inside the LAYERS dialog, e.g. why a delete was blocked
 
         self._dialog_file_names = []     # filled in by _build_file_list_dialog
         self._dialog_selected_name = None  # read by on_confirm_open / on_confirm_delete
@@ -652,9 +909,9 @@ class Model3DPage(Page):
         self.box_pick_start = None  # BOX's "CLICK ON GRID" mode -- first corner, or None
 
         # diagnostic only -- counts every on_touch call regardless of
-        # dialog state, shown in the mouse readout so a hardware test
-        # can tell "on_touch never fired" apart from "on_touch fired
-        # but the pick logic did nothing"
+        # dialog state, logged via ulog() so a hardware test can tell
+        # "on_touch never fired" apart from "on_touch fired but the
+        # pick logic did nothing"
         self.touch_count = 0
 
         self.active_command = None  # last command clicked, gets the red dashed frame
@@ -662,6 +919,106 @@ class Model3DPage(Page):
 
         self.undo_stack = []  # snapshots of (boxes, lines, circles, arcs, grid)
         self.redo_stack = []  # cleared whenever a new action is taken, not just undone
+
+        # most recent EXTRUDE's base + the geometry it generated, or
+        # None -- lets a second EXTRUDE on the same (just-edited) base
+        # replace the old generated pieces instead of adding a stale
+        # duplicate ("refresh"), and lets SELECT highlight the whole
+        # group instead of just whichever piece was clicked. Cleared
+        # whenever indices could no longer be trusted (DELETE/UNDO/
+        # REDO/NEW FILE/OPEN) -- see _remove_generated.
+        self._last_extrude = None
+
+        # live mouse tracking -- pcgui.GUI itself only ever fires
+        # on_touch (a discrete click), but pcgui.pccursor.mouse.query()
+        # is a separate, lower-level HID poll that returns the mouse's
+        # current screen position at any moment, click or not. Confirmed
+        # on real hardware: query('present') is 1 with a mouse attached,
+        # query('x')/query('y') read back live screen coordinates.
+        # _last_live_mouse_xy avoids redundant readout updates (and the
+        # position-readout math) on every 10ms tick when the mouse
+        # hasn't actually moved since the last poll.
+        self._last_live_mouse_xy = None
+
+        # template wireframes -- see save_wireframe_file/load_template_active
+        # near the top of this file. Independent of the open model:
+        # loaded once here, not touched by NEW FILE/OPEN, not part of
+        # undo/redo. template_main/template_local are the actual
+        # (size, spacing, scale, centerlines, show_xy, show_xz, show_yz)
+        # configs currently active, or None if that slot is unset or its
+        # saved file has gone missing.
+        self.template_main_name, self.template_local_name = load_template_active()
+        self.template_main = self._safe_load_wireframe(self.template_main_name)
+        self.template_local = self._safe_load_wireframe(self.template_local_name)
+        self._template_dialog_message = ""
+        # NEW TEMPLATE dialog's own working fields, separate from the
+        # active MAIN/LOCAL config above -- only written into a saved
+        # .wf file (and possibly promoted to a slot) on SAVE
+        self._template_new_pending = None  # (name, size, spacing, scale) strings, preserved across a same-dialog redraw
+        self._template_new_centerlines = True
+        self._template_new_xy = True
+        self._template_new_xz = True
+        self._template_new_yz = True
+
+    def _safe_load_wireframe(self, name):
+        if not name:
+            return None
+        try:
+            return load_wireframe_file(name)
+        except OSError as e:
+            ulog("Model3DPage: template '%s' missing: %s" % (name, e))
+            return None
+
+    def show(self):
+        # overrides Page.show() to add a live mouse-position poll into
+        # the same 10ms tick loop that already drives g.poll() -- see
+        # _poll_live_mouse. Everything else here matches Page.show()
+        # exactly.
+        hdmi.fill(hdmi.fb().colour(PAGE))
+        g = pcgui.GUI()
+        self.g = g
+        g.start()
+        self.build(g)
+        self.enter()
+        while self.next is None:
+            self.g.poll()
+            self._poll_live_mouse()
+            time.sleep_ms(10)
+        try:
+            self.g.stop()
+        except Exception:
+            pass
+        gc.collect()
+        return self.next
+
+    def _poll_live_mouse(self):
+        if self.dialog not in (None, "line_pick", "select_pick", "box_pick", "circle_pick"):
+            # no mouse_box on any other (modal) dialog -- see _build_main
+            return
+        try:
+            if not pcgui.pccursor.mouse.query("present"):
+                return
+            x = pcgui.pccursor.mouse.query("x")
+            y = pcgui.pccursor.mouse.query("y")
+        except Exception as e:
+            ulog("Model3DPage: live mouse query failed: " + str(e))
+            return
+        if (x, y) == self._last_live_mouse_xy:
+            return
+        self._last_live_mouse_xy = (x, y)
+        try:
+            self.mouse_box.value = self._safe_position_readout(x, y)
+        except Exception as e:
+            ulog("Model3DPage: live mouse readout failed: " + str(e))
+        if self.dialog == "circle_pick":
+            # lightweight repaint (just the framebuffer scene, not a
+            # full widget rebuild) so the snap-preview marker follows
+            # the mouse smoothly -- safe to call every tick now that
+            # _draw_axes cleans up its own widgets first
+            try:
+                self._draw_scene(self.g)
+            except Exception as e:
+                ulog("Model3DPage: circle preview redraw failed: " + str(e))
 
     def build(self, g):
         hdmi.fill(hdmi.fb().colour(self.BLACK))
@@ -700,7 +1057,18 @@ class Model3DPage(Page):
             self._build_edit_dialog(g)
         elif self.dialog == "layers":
             self._build_layers_dialog(g)
-        elif self.dialog == "line_pick" or self.dialog == "select_pick" or self.dialog == "box_pick":
+        elif self.dialog == "template":
+            self._build_template_dialog(g)
+        elif self.dialog == "template_pick_main":
+            self._build_wireframe_list_dialog(g, "PICK MAIN", "SELECT", self.on_confirm_pick_main)
+        elif self.dialog == "template_pick_local":
+            self._build_wireframe_list_dialog(g, "PICK LOCAL", "SELECT", self.on_confirm_pick_local)
+        elif self.dialog == "template_delete":
+            self._build_wireframe_list_dialog(g, "DELETE TEMPLATE", "DELETE", self.on_confirm_delete_template)
+        elif self.dialog == "template_new":
+            self._build_template_new_dialog(g)
+        elif (self.dialog == "line_pick" or self.dialog == "select_pick" or self.dialog == "box_pick"
+              or self.dialog == "circle_pick"):
             # reuses the normal main layout (canvas, zoom, D-pad, all
             # of it) rather than a modal -- picking points/elements
             # needs the wireframe/grid actually visible and clickable,
@@ -713,7 +1081,7 @@ class Model3DPage(Page):
     COMMAND_DIALOG = {
         "NEW FILE": "newfile", "OPEN": "open", "SAVE AS": "saveas", "DELETE": "delete",
         "SELECT": "select_pick", "LINE": "line_choice", "CTR LINE": "centerline", "BOX": "box_choice",
-        "CIRCLE": "circle", "ARC": "arc", "GRID": "grid",
+        "CIRCLE": "circle", "ARC": "arc", "GRID": "grid", "TEMPLATE": "template",
     }
 
     def _build_main(self, g):
@@ -748,6 +1116,8 @@ class Model3DPage(Page):
         elif self.dialog == "box_pick":
             verb = "FIRST" if self.box_pick_start is None else "OPPOSITE"
             self.status_box.value = "BOX: click %s corner in VIEW (%s) -- pick another command to cancel" % (verb, snap_status)
+        elif self.dialog == "circle_pick":
+            self.status_box.value = "CIRCLE: click centre in VIEW (%s) -- pick another command to cancel" % snap_status
 
         # mouse/touch coordinate readout below the panel
         self.mouse_box = g.displaybox(self.PANEL_X, self.PANEL_Y + self.PANEL_H + 4,
@@ -1099,17 +1469,20 @@ class Model3DPage(Page):
             self._draw_selection_marker(fb, scale, ox, oy)
             if self.grid and self.grid_visible:
                 self._draw_grid_dots(fb, scale, ox, oy)
+            if self.template_main:
+                self._draw_template_wireframe(fb, scale, ox, oy, self.template_main)
+            if self.template_local:
+                self._draw_template_wireframe(fb, scale, ox, oy, self.template_local)
+            if self.dialog == "circle_pick":
+                self._draw_circle_snap_preview(fb, scale, ox, oy)
 
             self._draw_axes(g, fb, scale, ox, oy)
         except Exception as e:
             ulog("Model3DPage: scene draw error: " + type(e).__name__ + " " + str(e))
 
-    def _selected_center_point(self):
-        # 3D point to mark for whatever's currently selected -- a
-        # midpoint for box/line, the centre itself for circle/arc
-        if not self.selected:
-            return None
-        kind, idx = self.selected
+    def _center_point_of(self, kind, idx):
+        # 3D point to mark for a given (kind, idx) -- a midpoint for
+        # box/line, the centre itself for circle/arc
         try:
             if kind == "box":
                 c0, c1 = self.boxes[idx][0], self.boxes[idx][1]
@@ -1125,12 +1498,35 @@ class Model3DPage(Page):
             return None
         return None
 
+    def _selected_center_point(self):
+        if not self.selected:
+            return None
+        return self._center_point_of(self.selected[0], self.selected[1])
+
+    def _selection_highlight_targets(self):
+        # normally just whatever's selected, but if it's part of the
+        # most recent extrude's base+generated group (see
+        # on_confirm_extrude/_last_extrude), highlight the whole group
+        # -- so clicking any one piece of an extrusion shows the whole
+        # thing, not just that one line/arc/circle
+        if not self.selected:
+            return []
+        if self._last_extrude:
+            group = [(self._last_extrude["kind"], self._last_extrude["idx"])] + self._last_extrude["generated"]
+            if self.selected in group:
+                return group
+        return [self.selected]
+
     def _draw_selection_marker(self, fb, scale, ox, oy):
         # additive-only feedback for SELECT -- a crosshair drawn ON TOP
         # of the (always-WHITE) selected geometry rather than replacing
         # its colour, so a marker that fails to render for whatever
         # reason still leaves the geometry itself visible
-        center = self._selected_center_point()
+        for kind, idx in self._selection_highlight_targets():
+            self._draw_one_selection_marker(fb, scale, ox, oy, kind, idx)
+
+    def _draw_one_selection_marker(self, fb, scale, ox, oy, kind, idx):
+        center = self._center_point_of(kind, idx)
         if center is None:
             return
         mx, my = self._project(center[0], center[1], center[2], scale, ox, oy)
@@ -1138,20 +1534,44 @@ class Model3DPage(Page):
         self._clipped_line(fb, mx - r, my, mx + r, my, self.SELECT_COLOR)
         self._clipped_line(fb, mx, my - r, mx, my + r, self.SELECT_COLOR)
 
+    def _draw_circle_snap_preview(self, fb, scale, ox, oy):
+        # live preview for CIRCLE's click-to-place centre step -- a
+        # crosshair at wherever a click would land right now (grid-
+        # snapped if SNAP TO GRID is on), so you can see the target
+        # before committing. Uses the last live-polled mouse position
+        # (see _poll_live_mouse); does nothing if the mouse hasn't been
+        # seen yet or is currently outside the canvas.
+        if self._last_live_mouse_xy is None:
+            return
+        x, y = self._last_live_mouse_xy
+        if not self._in_canvas(x, y):
+            return
+        try:
+            plane, point = self._plane_point_at(x, y)
+        except Exception:
+            return
+        mx, my = self._project(point[0], point[1], point[2], scale, ox, oy)
+        r = 6
+        self._clipped_line(fb, mx - r, my, mx + r, my, self.CIRCLE_PREVIEW_COLOR)
+        self._clipped_line(fb, mx, my - r, mx, my + r, self.CIRCLE_PREVIEW_COLOR)
+
     def _draw_grid_dots(self, fb, scale, ox, oy):
         # a dot at every grid intersection in its plane. Grey, not
         # white, so it reads as background reference rather than part
-        # of the actual model. Spans 0 to extent (not -extent to
-        # +extent) in both plane axes, matching every box/line/circle/
-        # arc's own 0-based convention. `position` places the whole
-        # plane along its normal axis (e.g. a "vertical" XZ grid's Y),
-        # so it can line up with an actual wall instead of sitting at 0.
-        plane, spacing, extent, position = self.grid
+        # of the actual model. Spans 0 to extent_i/extent_j (not
+        # -extent to +extent) in the plane's two axes -- independent
+        # extents so a grid can exactly cover a non-square face --
+        # matching every box/line/circle/arc's own 0-based convention.
+        # `position` places the whole plane along its normal axis (e.g.
+        # a "vertical" XZ grid's Y), so it can line up with an actual
+        # wall instead of sitting at 0.
+        plane, spacing, extent_i, extent_j, position = self.grid
         i, j = self.PLANE_AXES[plane]
         k = self._plane_normal_axis(plane)
-        n = int(extent / spacing)
-        for gi in range(0, n + 1):
-            for gj in range(0, n + 1):
+        ni = int(extent_i / spacing)
+        nj = int(extent_j / spacing)
+        for gi in range(0, ni + 1):
+            for gj in range(0, nj + 1):
                 p = [0.0, 0.0, 0.0]
                 p[i] = gi * spacing
                 p[j] = gj * spacing
@@ -1163,6 +1583,54 @@ class Model3DPage(Page):
                     _fb_pixel(fb, ix + 1, iy, self.GREY)
                     _fb_pixel(fb, ix, iy + 1, self.GREY)
                     _fb_pixel(fb, ix + 1, iy + 1, self.GREY)
+
+    def _draw_template_wireframe(self, fb, scale, ox, oy, cfg):
+        # a reference cube through the origin -- unlike the per-file
+        # GRID (0 to extent, matching the model's own convention), this
+        # spans -size/2 to +size/2 in each axis so it's actually
+        # centred on the origin, which is what makes "centre lines"
+        # (the two lines through 0,0 on each shown plane) meaningful.
+        size, spacing, template_scale, centerlines, show_xy, show_xz, show_yz = cfg
+        eff_size = size * template_scale
+        eff_spacing = spacing * template_scale
+        if eff_spacing <= 0:
+            return
+        half = eff_size / 2.0
+        show = {"XY": show_xy, "XZ": show_xz, "YZ": show_yz}
+        for plane in ("XY", "XZ", "YZ"):
+            if not show[plane]:
+                continue
+            i, j = self.PLANE_AXES[plane]
+            k = self._plane_normal_axis(plane)
+            n = int(eff_size / eff_spacing)
+            for gi in range(0, n + 1):
+                for gj in range(0, n + 1):
+                    p = [0.0, 0.0, 0.0]
+                    p[i] = -half + gi * eff_spacing
+                    p[j] = -half + gj * eff_spacing
+                    p[k] = 0.0
+                    sx, sy = self._project(p[0], p[1], p[2], scale, ox, oy)
+                    if self.CANVAS_X0 <= sx <= self.CANVAS_X1 and self.CANVAS_Y0 <= sy <= self.CANVAS_Y1:
+                        ix, iy = int(sx), int(sy)
+                        _fb_pixel(fb, ix, iy, self.GREY)
+                        _fb_pixel(fb, ix + 1, iy, self.GREY)
+                        _fb_pixel(fb, ix, iy + 1, self.GREY)
+                        _fb_pixel(fb, ix + 1, iy + 1, self.GREY)
+            if centerlines:
+                p0 = [0.0, 0.0, 0.0]
+                p0[i] = -half
+                p1 = [0.0, 0.0, 0.0]
+                p1[i] = half
+                s0 = self._project(p0[0], p0[1], p0[2], scale, ox, oy)
+                s1 = self._project(p1[0], p1[1], p1[2], scale, ox, oy)
+                self._clipped_line(fb, s0[0], s0[1], s1[0], s1[1], self.GREY)
+                p2 = [0.0, 0.0, 0.0]
+                p2[j] = -half
+                p3 = [0.0, 0.0, 0.0]
+                p3[j] = half
+                s2 = self._project(p2[0], p2[1], p2[2], scale, ox, oy)
+                s3 = self._project(p3[0], p3[1], p3[2], scale, ox, oy)
+                self._clipped_line(fb, s2[0], s2[1], s3[0], s3[1], self.GREY)
 
     def _draw_arc(self, fb, center, radius, plane, a0, a1, scale, ox, oy, segments=32, colour=WHITE):
         # approximates a circle (a0=0, a1=360) or arc as a polyline of
@@ -1189,6 +1657,20 @@ class Model3DPage(Page):
         # otherwise, with the model hidden, all that's left on screen is
         # a short sliver near the tip (or nothing at all, if that
         # sliver falls outside the canvas).
+        #
+        # the axis/origin labels are real g.caption() widgets (not raw
+        # framebuffer pixels), so calling this repeatedly without
+        # removing the previous batch first would pile up stale
+        # duplicates -- matters now that _draw_scene (which calls this)
+        # can be invoked directly on every live mouse-move tick, not
+        # just from a full build()
+        for w in self._axis_label_widgets:
+            try:
+                g.remove(w)
+            except Exception:
+                pass
+        self._axis_label_widgets = []
+
         length = self._axis_length()
         wing = length * 0.15
         axis_index = {"X": 0, "Y": 1, "Z": 2}
@@ -1210,10 +1692,12 @@ class Model3DPage(Page):
             self._clipped_line(fb, tip[0], tip[1], w2s[0], w2s[1], colour)
 
             if self.CANVAS_X0 <= tip[0] <= self.CANVAS_X1 and self.CANVAS_Y0 <= tip[1] <= self.CANVAS_Y1:
-                g.caption(int(tip[0]) + 6, int(tip[1]) - 8, axis, fg=colour, bg=self.BLACK, font=1)
+                w = g.caption(int(tip[0]) + 6, int(tip[1]) - 8, axis, fg=colour, bg=self.BLACK, font=1)
+                self._axis_label_widgets.append(w)
 
         origin = self._project(0, 0, 0, scale, ox, oy)
-        g.caption(int(origin[0]) + 6, int(origin[1]) + 4, "0,0", fg=WHITE, bg=self.BLACK, font=1)
+        w = g.caption(int(origin[0]) + 6, int(origin[1]) + 4, "0,0", fg=WHITE, bg=self.BLACK, font=1)
+        self._axis_label_widgets.append(w)
 
     # --- modal dialogs --------------------------------------------------
 
@@ -1247,16 +1731,28 @@ class Model3DPage(Page):
                  callback=self.on_cancel_dialog)
 
     def _build_saveas_dialog(self, g):
-        h = 160
+        h = 280
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "SAVE AS", fg=WHITE, font=2)
         g.caption(self.DLG_X + 20, y0 + 40, "Name:", fg=WHITE, bg=self.BLACK, font=1)
         self.saveas_box = g.textbox(self.DLG_X + 20, y0 + 58, self.DLG_W - 40, 26,
                                      self.model_name, font=1)
-        g.button(self.DLG_X + 20, y0 + 96, 120, 40, "SAVE", fg=WHITE, bg=BTN, font=2,
+
+        # EXPORT STL below reuses this same name field -- solidifies
+        # LINE/CIRCLE/ARC edges into struts of this thickness (BOX
+        # elements are already solid, unaffected). See the STL export
+        # module comment near write_stl_file for what this can't do
+        # (it's not a slicer -- load the .stl into one for G-code).
+        g.caption(self.DLG_X + 20, y0 + 100, "STL strut thickness (mm):", fg=WHITE, bg=self.BLACK, font=1)
+        self.stl_thickness_box = g.textbox(self.DLG_X + 20, y0 + 118, self.DLG_W - 40, 26,
+                                            str(self.stl_strut_thickness), font=1)
+
+        g.button(self.DLG_X + 20, y0 + h - 110, 120, 40, "SAVE", fg=WHITE, bg=BTN, font=2,
                  callback=self.on_confirm_saveas)
-        g.button(self.DLG_X + 180, y0 + 96, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+        g.button(self.DLG_X + 180, y0 + h - 110, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
+        g.button(self.DLG_X + 20, y0 + h - 60, self.DLG_W - 40, 40, "EXPORT STL", fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_confirm_export_stl)
 
     def _build_line_choice_dialog(self, g):
         h = 180
@@ -1346,24 +1842,35 @@ class Model3DPage(Page):
                  callback=self.on_cancel_dialog)
 
     def _build_circle_dialog(self, g):
-        h = 300
+        # radius (+ plane, + snap) only -- the centre is placed by
+        # clicking in VIEW afterward (see on_confirm_circle/circle_pick)
+        # rather than typed, with a live snap-preview marker following
+        # the mouse (_draw_circle_snap_preview)
+        h = 280
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "CIRCLE" + self._grid_snap_title_suffix(), fg=WHITE, font=2)
 
-        labels = ("Center X:", "Center Y:", "Center Z:", "Radius:")
-        boxes = []
-        for i, label in enumerate(labels):
-            ly = y0 + 36 + i * 40
-            g.caption(self.DLG_X + 20, ly + 6, label, fg=WHITE, bg=self.BLACK, font=1)
-            boxes.append(g.textbox(self.DLG_X + 130, ly, 100, 26, "", font=1))
-        self.circle_cx_box, self.circle_cy_box, self.circle_cz_box, self.circle_r_box = boxes
+        if self._circle_radius_pending is not None:
+            radius_str = self._circle_radius_pending
+            self._circle_radius_pending = None
+        else:
+            radius_str = ""
 
-        ly = y0 + 36 + 4 * 40
+        ly = y0 + 40
+        g.caption(self.DLG_X + 20, ly + 6, "Radius:", fg=WHITE, bg=self.BLACK, font=1)
+        self.circle_r_box = g.textbox(self.DLG_X + 160, ly, 100, 26, radius_str, font=1)
+
+        ly += 44
         g.caption(self.DLG_X + 20, ly + 6, "Plane:", fg=WHITE, bg=self.BLACK, font=1)
-        g.button(self.DLG_X + 130, ly, 100, 26, self.circle_plane, fg=WHITE, bg=BTN, font=1,
+        g.button(self.DLG_X + 160, ly, 100, 26, self.circle_plane, fg=WHITE, bg=BTN, font=1,
                  callback=self.on_cycle_circle_plane)
 
-        g.button(self.DLG_X + 20, y0 + h - 60, 120, 40, "CREATE", fg=WHITE, bg=BTN, font=2,
+        ly += 44
+        snap_label = "SNAP TO GRID: ON" if self.snap_enabled else "SNAP TO GRID: OFF"
+        g.button(self.DLG_X + 20, ly, self.DLG_W - 40, 32, snap_label, fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_toggle_circle_snap)
+
+        g.button(self.DLG_X + 20, y0 + h - 60, 120, 40, "NEXT", fg=WHITE, bg=BTN, font=2,
                  callback=self.on_confirm_circle)
         g.button(self.DLG_X + 180, y0 + h - 60, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
@@ -1412,17 +1919,35 @@ class Model3DPage(Page):
                  callback=self.on_cancel_dialog)
 
     def _build_grid_dialog(self, g):
-        h = 304
+        h = 348
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "GRID", fg=WHITE, font=2)
 
+        # pre-fill from the current grid (if any) so re-opening this
+        # dialog to tweak an existing grid doesn't mean retyping every
+        # field from scratch
+        if self.grid:
+            _, cur_spacing, cur_extent_i, cur_extent_j, cur_position = self.grid
+        else:
+            cur_spacing, cur_extent_i, cur_extent_j, cur_position = 10, 100, 100, 0
+
+        # independent per-axis extents, so a grid can exactly cover a
+        # non-square face instead of being forced into a square region
+        axis_i, axis_j = self.PLANE_AXES[self.grid_plane]
+        axis_i_name = self.AXIS_NAMES[axis_i]
+        axis_j_name = self.AXIS_NAMES[axis_j]
+
         ly = y0 + 40
         g.caption(self.DLG_X + 20, ly + 6, "Spacing (mm):", fg=WHITE, bg=self.BLACK, font=1)
-        self.grid_spacing_box = g.textbox(self.DLG_X + 160, ly, 100, 26, "10", font=1)
+        self.grid_spacing_box = g.textbox(self.DLG_X + 160, ly, 100, 26, str(cur_spacing), font=1)
 
         ly += 44
-        g.caption(self.DLG_X + 20, ly + 6, "Extent (mm):", fg=WHITE, bg=self.BLACK, font=1)
-        self.grid_extent_box = g.textbox(self.DLG_X + 160, ly, 100, 26, "100", font=1)
+        g.caption(self.DLG_X + 20, ly + 6, "Extent " + axis_i_name + " (mm):", fg=WHITE, bg=self.BLACK, font=1)
+        self.grid_extent_i_box = g.textbox(self.DLG_X + 160, ly, 100, 26, str(cur_extent_i), font=1)
+
+        ly += 44
+        g.caption(self.DLG_X + 20, ly + 6, "Extent " + axis_j_name + " (mm):", fg=WHITE, bg=self.BLACK, font=1)
+        self.grid_extent_j_box = g.textbox(self.DLG_X + 160, ly, 100, 26, str(cur_extent_j), font=1)
 
         ly += 44
         g.caption(self.DLG_X + 20, ly + 6, "Plane:", fg=WHITE, bg=self.BLACK, font=1)
@@ -1435,7 +1960,7 @@ class Model3DPage(Page):
         # line up with an actual wall instead of always sitting at 0
         axis_name = self.AXIS_NAMES[self._plane_normal_axis(self.grid_plane)]
         g.caption(self.DLG_X + 20, ly + 6, axis_name + " position (mm):", fg=WHITE, bg=self.BLACK, font=1)
-        self.grid_position_box = g.textbox(self.DLG_X + 160, ly, 100, 26, "0", font=1)
+        self.grid_position_box = g.textbox(self.DLG_X + 160, ly, 100, 26, str(cur_position), font=1)
 
         g.button(self.DLG_X + 20, y0 + h - 60, 120, 40, "CREATE", fg=WHITE, bg=BTN, font=2,
                  callback=self.on_confirm_grid)
@@ -1523,7 +2048,7 @@ class Model3DPage(Page):
                  callback=self.on_cancel_dialog)
 
     def _build_layers_dialog(self, g):
-        h = 280
+        h = 340
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "LAYERS", fg=WHITE, font=2)
 
@@ -1542,9 +2067,14 @@ class Model3DPage(Page):
                  callback=self.on_set_active_layer)
         g.button(self.DLG_X + 170, y0 + 170, 130, 36, "TOGGLE SHOW", fg=WHITE, bg=BTN, font=1,
                  callback=self.on_toggle_layer_visible)
-        g.button(self.DLG_X + 20, y0 + 212, 130, 36, "NEW LAYER", fg=WHITE, bg=BTN, font=1,
+        g.button(self.DLG_X + 20, y0 + 212, self.DLG_W - 40, 36, "DELETE LAYER", fg=WHITE, bg=RED, font=1,
+                 callback=self.on_delete_layer)
+        if self._layers_dialog_message:
+            g.caption(self.DLG_X + self.DLG_W // 2, y0 + 258, self._layers_dialog_message,
+                       fg=WHITE, bg=self.BLACK, font=1, just="CT")
+        g.button(self.DLG_X + 20, y0 + h - 60, 130, 40, "NEW LAYER", fg=WHITE, bg=BTN, font=1,
                  callback=self.on_new_layer)
-        g.button(self.DLG_X + 170, y0 + 212, 130, 36, "CLOSE", fg=WHITE, bg=RED, font=2,
+        g.button(self.DLG_X + 170, y0 + h - 60, 130, 40, "CLOSE", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
 
     def _build_file_list_dialog(self, g, title, action_label, action_callback):
@@ -1581,6 +2111,245 @@ class Model3DPage(Page):
         if 0 <= i < len(self._dialog_file_names):
             self._dialog_selected_name = self._dialog_file_names[i]
 
+    # --- template wireframes -----------------------------------------
+
+    def _build_template_dialog(self, g):
+        h = 300
+        y0 = (480 - h) // 2
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "TEMPLATE", fg=WHITE, font=2)
+
+        ly = y0 + 44
+        main_label = self.template_main_name if self.template_main_name else "(none)"
+        g.caption(self.DLG_X + 20, ly, "MAIN: " + main_label, fg=WHITE, bg=self.BLACK, font=1)
+        ly += 24
+        local_label = self.template_local_name if self.template_local_name else "(none)"
+        g.caption(self.DLG_X + 20, ly, "LOCAL: " + local_label, fg=WHITE, bg=self.BLACK, font=1)
+
+        ly += 36
+        g.button(self.DLG_X + 20, ly, 130, 36, "PICK MAIN", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_open_template_pick_main)
+        g.button(self.DLG_X + 170, ly, 130, 36, "PICK LOCAL", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_open_template_pick_local)
+
+        ly += 46
+        g.button(self.DLG_X + 20, ly, 130, 36, "NEW", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_open_template_new)
+        g.button(self.DLG_X + 170, ly, 130, 36, "DELETE", fg=WHITE, bg=RED, font=1,
+                 callback=self.on_open_template_delete)
+
+        if self._template_dialog_message:
+            g.caption(self.DLG_X + self.DLG_W // 2, ly + 46, self._template_dialog_message,
+                       fg=WHITE, bg=self.BLACK, font=1, just="CT")
+
+        g.button(self.DLG_X + 20, y0 + h - 50, self.DLG_W - 40, 36, "CLOSE", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_dialog)
+
+    def _build_wireframe_list_dialog(self, g, title, action_label, action_callback):
+        # mirrors _build_file_list_dialog, but lists saved templates
+        # (list_saved_wireframes) instead of models, and CANCEL returns
+        # to the TEMPLATE manager dialog rather than the main panel
+        h = 240
+        y0 = (480 - h) // 2
+        g.frame(self.DLG_X, y0, self.DLG_W, h, title, fg=WHITE, font=2)
+        saved = list_saved_wireframes()
+        self._dialog_file_names = saved
+        if not saved:
+            g.caption(self.DLG_X + self.DLG_W // 2, y0 + 60, "No saved templates yet",
+                      fg=WHITE, bg=self.BLACK, font=1, just="CT")
+            g.button(self.DLG_X + 100, y0 + 180, 120, 40, "CLOSE", fg=WHITE, bg=BTN, font=2,
+                     callback=self.on_cancel_to_template)
+            return
+        self._dialog_selected_name = saved[0]
+        self.dialog_list = g.listbox(self.DLG_X + 20, y0 + 40, self.DLG_W - 40, 120, saved, 0,
+                                      font=1, callback=self.on_pick_dialog_file)
+        g.button(self.DLG_X + 20, y0 + 180, 120, 40, action_label, fg=WHITE, bg=BTN, font=2,
+                 callback=action_callback)
+        g.button(self.DLG_X + 180, y0 + 180, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_to_template)
+
+    def _build_template_new_dialog(self, g):
+        h = 400
+        y0 = (480 - h) // 2
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "NEW TEMPLATE", fg=WHITE, font=2)
+
+        if self._template_new_pending:
+            name_str, size_str, spacing_str, scale_str = self._template_new_pending
+            self._template_new_pending = None
+        else:
+            name_str, size_str, spacing_str, scale_str = "", "1000", "100", "1"
+
+        ly = y0 + 36
+        g.caption(self.DLG_X + 20, ly + 6, "Name:", fg=WHITE, bg=self.BLACK, font=1)
+        self.template_new_name_box = g.textbox(self.DLG_X + 130, ly, 160, 26, name_str, font=1)
+
+        ly += 38
+        g.caption(self.DLG_X + 20, ly + 6, "Size (mm):", fg=WHITE, bg=self.BLACK, font=1)
+        self.template_new_size_box = g.textbox(self.DLG_X + 130, ly, 100, 26, size_str, font=1)
+
+        ly += 38
+        g.caption(self.DLG_X + 20, ly + 6, "Spacing (mm):", fg=WHITE, bg=self.BLACK, font=1)
+        self.template_new_spacing_box = g.textbox(self.DLG_X + 130, ly, 100, 26, spacing_str, font=1)
+
+        ly += 38
+        g.caption(self.DLG_X + 20, ly + 6, "Scale factor:", fg=WHITE, bg=self.BLACK, font=1)
+        self.template_new_scale_box = g.textbox(self.DLG_X + 130, ly, 100, 26, scale_str, font=1)
+
+        ly += 44
+        centerlines_label = "CTR LINES: ON" if self._template_new_centerlines else "CTR LINES: OFF"
+        g.button(self.DLG_X + 20, ly, 140, 32, centerlines_label, fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_toggle_new_centerlines)
+
+        ly += 40
+        xy_label = "XY: ON" if self._template_new_xy else "XY: OFF"
+        g.button(self.DLG_X + 20, ly, 90, 32, xy_label, fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_toggle_new_xy)
+        xz_label = "XZ: ON" if self._template_new_xz else "XZ: OFF"
+        g.button(self.DLG_X + 115, ly, 90, 32, xz_label, fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_toggle_new_xz)
+        yz_label = "YZ: ON" if self._template_new_yz else "YZ: OFF"
+        g.button(self.DLG_X + 210, ly, 90, 32, yz_label, fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_toggle_new_yz)
+
+        if self._template_dialog_message:
+            g.caption(self.DLG_X + self.DLG_W // 2, ly + 38, self._template_dialog_message,
+                       fg=WHITE, bg=self.BLACK, font=1, just="CT")
+
+        g.button(self.DLG_X + 20, y0 + h - 50, 120, 40, "SAVE", fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_confirm_template_new)
+        g.button(self.DLG_X + 180, y0 + h - 50, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_to_template)
+
+    def on_cancel_to_template(self, b):
+        self.dialog = "template"
+        self._template_dialog_message = ""
+        self._redraw()
+
+    def on_open_template_pick_main(self, b):
+        self.dialog = "template_pick_main"
+        self._redraw()
+
+    def on_open_template_pick_local(self, b):
+        self.dialog = "template_pick_local"
+        self._redraw()
+
+    def on_open_template_delete(self, b):
+        self.dialog = "template_delete"
+        self._redraw()
+
+    def on_open_template_new(self, b):
+        self._template_new_pending = None
+        self._template_new_centerlines = True
+        self._template_new_xy = True
+        self._template_new_xz = True
+        self._template_new_yz = True
+        self._template_dialog_message = ""
+        self.dialog = "template_new"
+        self._redraw()
+
+    def on_confirm_pick_main(self, b):
+        name = getattr(self, "_dialog_selected_name", None)
+        self.dialog = "template"
+        if not name:
+            self._redraw()
+            return
+        self.template_main_name = name
+        self.template_main = self._safe_load_wireframe(name)
+        save_template_active(self.template_main_name, self.template_local_name)
+        self._redraw()
+
+    def on_confirm_pick_local(self, b):
+        name = getattr(self, "_dialog_selected_name", None)
+        self.dialog = "template"
+        if not name:
+            self._redraw()
+            return
+        self.template_local_name = name
+        self.template_local = self._safe_load_wireframe(name)
+        save_template_active(self.template_main_name, self.template_local_name)
+        self._redraw()
+
+    def on_confirm_delete_template(self, b):
+        name = getattr(self, "_dialog_selected_name", None)
+        self.dialog = "template"
+        if not name:
+            self._redraw()
+            return
+        delete_wireframe_file(name)
+        # if the deleted template was active in either slot, clear that
+        # slot too rather than leaving a dangling name pointing nowhere
+        if self.template_main_name == name:
+            self.template_main_name = None
+            self.template_main = None
+        if self.template_local_name == name:
+            self.template_local_name = None
+            self.template_local = None
+        save_template_active(self.template_main_name, self.template_local_name)
+        self._template_dialog_message = "Deleted " + name
+        self._redraw()
+
+    def on_toggle_new_centerlines(self, b):
+        self._stash_template_new_fields()
+        self._template_new_centerlines = not self._template_new_centerlines
+        self._redraw_dialog_in_place()
+
+    def on_toggle_new_xy(self, b):
+        self._stash_template_new_fields()
+        self._template_new_xy = not self._template_new_xy
+        self._redraw_dialog_in_place()
+
+    def on_toggle_new_xz(self, b):
+        self._stash_template_new_fields()
+        self._template_new_xz = not self._template_new_xz
+        self._redraw_dialog_in_place()
+
+    def on_toggle_new_yz(self, b):
+        self._stash_template_new_fields()
+        self._template_new_yz = not self._template_new_yz
+        self._redraw_dialog_in_place()
+
+    def _stash_template_new_fields(self):
+        # preserves whatever's currently typed across the redraw a
+        # toggle button triggers -- same problem/fix as GRID's own
+        # plane-cycle button (see on_cycle_grid_plane)
+        self._template_new_pending = (
+            self.template_new_name_box.value, self.template_new_size_box.value,
+            self.template_new_spacing_box.value, self.template_new_scale_box.value)
+
+    def on_confirm_template_new(self, b):
+        name = self.template_new_name_box.value.strip()
+        if not name:
+            self._template_dialog_message = "Name can't be empty"
+            self._redraw_dialog_in_place()
+            return
+
+        def parse(box, fallback):
+            try:
+                v = float(box.value)
+                return v if v > 0 else fallback
+            except (ValueError, TypeError):
+                return fallback
+        size = parse(self.template_new_size_box, 1000.0)
+        spacing = parse(self.template_new_spacing_box, 100.0)
+        scale = parse(self.template_new_scale_box, 1.0)
+        # spacing/size scale together, so the dot-count check only
+        # needs the unscaled ratio -- scale can't push it over the cap
+        n = int(size / spacing)
+        dot_count = (n + 1) ** 2
+        if n < 1:
+            self._template_dialog_message = "size must be at least as large as spacing"
+            self._redraw_dialog_in_place()
+            return
+        if dot_count > self.GRID_MAX_DOTS:
+            self._template_dialog_message = "%d points is too many (max %d)" % (dot_count, self.GRID_MAX_DOTS)
+            self._redraw_dialog_in_place()
+            return
+        cfg = (size, spacing, scale, self._template_new_centerlines,
+               self._template_new_xy, self._template_new_xz, self._template_new_yz)
+        save_wireframe_file(name, cfg)
+        self.dialog = "template"
+        self._template_dialog_message = "Saved " + name
+        self._redraw()
+
     def on_confirm_newfile(self, b):
         def parse(box, fallback):
             try:
@@ -1603,6 +2372,7 @@ class Model3DPage(Page):
         self.current_layer = "Layer1"
         self.layer_visible = {"Layer1": True}
         self.selected = None
+        self._last_extrude = None
         self.dialog = None
         self._redraw()
         self.status_box.value = "NEW FILE: %g x %g x %g mm box" % (x, y, z)
@@ -1622,6 +2392,62 @@ class Model3DPage(Page):
         except Exception as e:
             self.status_box.value = "SAVE AS failed: " + type(e).__name__ + " " + str(e)
             ulog("Model3DPage SAVE AS error: " + type(e).__name__ + " " + str(e))
+
+    def _model_to_stl_triangles(self, strut_half_width):
+        # only what's actually modelled, and only from visible layers
+        # (matching the on-screen view) -- never GRID or the template
+        # wireframes, both explicitly not part of the real model
+        triangles = []
+        for c0, c1, layer in self.boxes:
+            if not self.layer_visible.get(layer, True):
+                continue
+            triangles.extend(_box_triangles(c0, c1))
+        for p0, p1, layer in self.lines:
+            if not self.layer_visible.get(layer, True):
+                continue
+            triangles.extend(_strut_triangles(p0, p1, strut_half_width))
+        for center, radius, plane, layer in self.circles:
+            if not self.layer_visible.get(layer, True):
+                continue
+            segments = 32
+            pts = [self._circle_point(center, radius, plane, 360.0 * i / segments) for i in range(segments)]
+            for i in range(segments):
+                triangles.extend(_strut_triangles(pts[i], pts[(i + 1) % segments], strut_half_width))
+        for center, radius, plane, a0, a1, layer in self.arcs:
+            if not self.layer_visible.get(layer, True):
+                continue
+            sweep = a1 - a0
+            segments = max(3, int(round(32 * abs(sweep) / 360.0)))
+            pts = [self._circle_point(center, radius, plane, a0 + sweep * i / segments)
+                   for i in range(segments + 1)]
+            for i in range(segments):
+                triangles.extend(_strut_triangles(pts[i], pts[i + 1], strut_half_width))
+        return triangles
+
+    def on_confirm_export_stl(self, b):
+        name = (self.saveas_box.value or "").strip()
+        try:
+            thickness = float(self.stl_thickness_box.value)
+            if thickness <= 0:
+                thickness = 4.0
+        except (ValueError, TypeError):
+            thickness = 4.0
+        self.stl_strut_thickness = thickness
+        self.dialog = None
+        self._redraw()
+        if not name:
+            self.status_box.value = "EXPORT STL cancelled -- no name entered"
+            return
+        try:
+            triangles = self._model_to_stl_triangles(thickness / 2.0)
+            if not triangles:
+                self.status_box.value = "EXPORT STL: nothing visible to export"
+                return
+            path = save_stl_file(name, triangles)
+            self.status_box.value = "Exported %d triangles to %s" % (len(triangles), name + ".stl")
+        except Exception as e:
+            self.status_box.value = "EXPORT STL failed: " + type(e).__name__ + " " + str(e)
+            ulog("Model3DPage EXPORT STL error: " + type(e).__name__ + " " + str(e))
 
     def on_confirm_open(self, b):
         # load THEN redraw, not the other way round -- redrawing first
@@ -1646,6 +2472,7 @@ class Model3DPage(Page):
             self.layer_visible = layer_visible
             self.current_layer = layers[0]
             self.selected = None
+            self._last_extrude = None
             self.model_name = name
             self._redraw()
             self.status_box.value = "Opened " + name
@@ -1738,31 +2565,33 @@ class Model3DPage(Page):
         self.status_box.value = "BOX: %s to %s" % (corner_min, corner_max)
 
     def on_cycle_circle_plane(self, b):
+        self._circle_radius_pending = self.circle_r_box.value
         order = ("XY", "XZ", "YZ")
         self.circle_plane = order[(order.index(self.circle_plane) + 1) % 3]
         self._redraw()
 
+    def on_toggle_circle_snap(self, b):
+        self._circle_radius_pending = self.circle_r_box.value
+        self.snap_enabled = not self.snap_enabled
+        self._redraw()
+
     def on_confirm_circle(self, b):
+        # only the radius is typed -- confirming this hands off to
+        # circle_pick, where the centre is placed by clicking in VIEW
+        # (with a live snap preview), not typed
         def parse(box, fallback):
             try:
                 v = float(box.value)
             except (ValueError, TypeError):
                 v = fallback
             return self._snap_to_grid(v)
-        cx = parse(self.circle_cx_box, 0.0)
-        cy = parse(self.circle_cy_box, 0.0)
-        cz = parse(self.circle_cz_box, 0.0)
         r = parse(self.circle_r_box, 20.0)
         if r <= 0:
             r = 20.0
         r = self._snap_length_to_grid(r)
-        self._push_undo()
-        self.circles.append(((cx, cy, cz), r, self.circle_plane, self.current_layer))
-        for p0, p1 in self._circle_centerline_segments((cx, cy, cz), r, self.circle_plane):
-            self.lines.append((p0, p1, self.current_layer))
-        self.dialog = None
+        self._circle_pick_radius = r
+        self.dialog = "circle_pick"
         self._redraw()
-        self.status_box.value = "CIRCLE: centre (%g,%g,%g) r=%g %s" % (cx, cy, cz, r, self.circle_plane)
 
     def _circle_centerline_segments(self, center, radius, plane):
         # a technical-drawing-style center mark -- two short reference
@@ -1866,36 +2695,42 @@ class Model3DPage(Page):
             except (ValueError, TypeError):
                 return fallback
         spacing = parse(self.grid_spacing_box, 10.0)
-        extent = parse(self.grid_extent_box, 100.0)
+        extent_i = parse(self.grid_extent_i_box, 100.0)
+        extent_j = parse(self.grid_extent_j_box, 100.0)
         try:
             position = float(self.grid_position_box.value)
         except (ValueError, TypeError):
             position = 0.0
-        position = self._snap_to_grid(position)
-        n = int(extent / spacing)
+        if self.snap_enabled and spacing > 0:
+            # snap to the spacing just typed in this dialog, not
+            # self.grid's (old) spacing -- self.grid isn't updated
+            # until below, so _snap_to_grid would use stale spacing
+            position = round(position / spacing) * spacing
+        ni = int(extent_i / spacing)
+        nj = int(extent_j / spacing)
         self.dialog = None
-        if n < 1:
-            # extent smaller than spacing -- collapses to a single dot
-            # at the origin, which looks identical no matter which
-            # plane is selected (they all pass through 0,0,0)
+        if ni < 1 or nj < 1:
+            # either extent smaller than spacing -- collapses that axis
+            # to a single dot at the origin
             self._redraw()
-            self.status_box.value = "GRID: extent must be at least as large as spacing"
+            self.status_box.value = "GRID: both extents must be at least as large as spacing"
             return
-        dot_count = (n + 1) ** 2
+        dot_count = (ni + 1) * (nj + 1)
         if dot_count > self.GRID_MAX_DOTS:
             self._redraw()
             self.status_box.value = ("GRID: %d points is too many (max %d) -- "
                                       "use a bigger spacing or smaller extent" % (dot_count, self.GRID_MAX_DOTS))
             return
         self._push_undo()
-        self.grid = (self.grid_plane, spacing, extent, position)
+        self.grid = (self.grid_plane, spacing, extent_i, extent_j, position)
         self._redraw()
         axis_name = self.AXIS_NAMES[self._plane_normal_axis(self.grid_plane)]
-        self.status_box.value = "GRID: %s, %g mm spacing, %g mm extent, %s=%g" % (
-            self.grid_plane, spacing, extent, axis_name, position)
+        self.status_box.value = "GRID: %s, %g mm spacing, %gx%g mm extent, %s=%g" % (
+            self.grid_plane, spacing, extent_i, extent_j, axis_name, position)
 
     def on_open_layers(self, b):
         self._dialog_selected_layer = self.current_layer
+        self._layers_dialog_message = ""
         self.dialog = "layers"
         self._redraw()
 
@@ -1903,6 +2738,7 @@ class Model3DPage(Page):
         i = c.value
         if 0 <= i < len(self.layers):
             self._dialog_selected_layer = self.layers[i]
+            self._layers_dialog_message = ""
 
     def on_set_active_layer(self, b):
         self.current_layer = self._dialog_selected_layer
@@ -1922,6 +2758,47 @@ class Model3DPage(Page):
         self.layers.append(name)
         self.layer_visible[name] = True
         self._dialog_selected_layer = name
+        self._layers_dialog_message = ""
+        self._redraw_dialog_in_place()
+
+    def _layer_item_count(self, name):
+        # how many boxes/lines/circles/arcs are tagged with this layer
+        # -- used to block deleting a layer out from under real items
+        # rather than silently orphaning their layer tag
+        count = 0
+        for box in self.boxes:
+            if box[2] == name:
+                count += 1
+        for line in self.lines:
+            if line[2] == name:
+                count += 1
+        for circle in self.circles:
+            if circle[3] == name:
+                count += 1
+        for arc in self.arcs:
+            if arc[5] == name:
+                count += 1
+        return count
+
+    def on_delete_layer(self, b):
+        name = self._dialog_selected_layer
+        if len(self.layers) <= 1:
+            self._layers_dialog_message = "Can't delete the only layer"
+            self._redraw_dialog_in_place()
+            return
+        count = self._layer_item_count(name)
+        if count > 0:
+            self._layers_dialog_message = "%d item%s still on this layer" % (
+                count, "" if count == 1 else "s")
+            self._redraw_dialog_in_place()
+            return
+        self._push_undo()
+        self.layers.remove(name)
+        self.layer_visible.pop(name, None)
+        if self.current_layer == name:
+            self.current_layer = self.layers[0]
+        self._dialog_selected_layer = self.current_layer
+        self._layers_dialog_message = ""
         self._redraw_dialog_in_place()
 
     def _redraw_dialog_in_place(self):
@@ -1956,6 +2833,13 @@ class Model3DPage(Page):
             # list below once nothing's currently selected
             self._delete_selected()
             return
+        elif name == "GRID" and self.grid:
+            # pre-fill the plane toggle from the actual current grid,
+            # not whatever was last left over from a previous (possibly
+            # cancelled) visit to this dialog
+            self.grid_plane = self.grid[0]
+        elif name == "TEMPLATE":
+            self._template_dialog_message = ""
         target = self.COMMAND_DIALOG.get(name)
         if target is None:
             self._redraw()
@@ -1973,6 +2857,9 @@ class Model3DPage(Page):
         del collection[idx]
         self.selected = None
         self.dialog = None
+        # any tracked "last extrude" indices could now point at the
+        # wrong thing -- see on_confirm_extrude/_remove_generated
+        self._last_extrude = None
         self._redraw()
         self.status_box.value = "DELETE: removed %s #%d (undoable)" % (kind.upper(), idx + 1)
 
@@ -1997,7 +2884,7 @@ class Model3DPage(Page):
         ox, oy = self._last_origin
         normal_offset = 0.0
         if self.grid and self.grid[0] == plane:
-            normal_offset = self.grid[3]
+            normal_offset = self.grid[4]  # (plane, spacing, extent_i, extent_j, position)
         offset_x = offset_y = 0.0
         if normal_offset:
             k = self._plane_normal_axis(plane)
@@ -2029,13 +2916,14 @@ class Model3DPage(Page):
     def _snap_to_grid_point(self, point):
         if not self.grid or not self.snap_enabled:
             return point
-        plane, spacing, extent, position = self.grid
+        plane, spacing, extent_i, extent_j, position = self.grid
         i, j = self.PLANE_AXES[plane]
         k = self._plane_normal_axis(plane)
         p = list(point)
+        extents = {i: extent_i, j: extent_j}
         for idx in (i, j):
             v = round(p[idx] / spacing) * spacing
-            p[idx] = max(0.0, min(extent, v))
+            p[idx] = max(0.0, min(extents[idx], v))
         p[k] = position
         return (p[0], p[1], p[2])
 
@@ -2148,6 +3036,9 @@ class Model3DPage(Page):
         if self.dialog == "box_pick":
             self._on_box_pick_touch(x, y)
             return
+        if self.dialog == "circle_pick":
+            self._on_circle_pick_touch(x, y)
+            return
         #
         # DRAG CAVEAT: panning is reconstructed from on_touch rather
         # than a continuous drag hook: two clicks inside the
@@ -2182,7 +3073,7 @@ class Model3DPage(Page):
         except Exception as e:
             ulog("Model3DPage: position readout error: " + type(e).__name__ + " " + str(e))
             text = "Mouse: (%d, %d)" % (x, y)
-        return "T:%d  " % self.touch_count + text
+        return text
 
     def _on_line_pick_touch(self, x, y):
         # LINE's "CLICK ON GRID" mode -- two clicks in the canvas set
@@ -2190,21 +3081,20 @@ class Model3DPage(Page):
         # on_touch drag caveat above). Every branch here updates
         # status_box directly so a click's outcome is visible on
         # screen immediately.
-        tag = "T:%d  " % self.touch_count
         if not self._in_canvas(x, y):
-            self.status_box.value = tag + "LINE: click (%d,%d) was outside the VIEW panel" % (x, y)
+            self.status_box.value = "LINE: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
         try:
             plane, point = self._plane_point_at(x, y)
         except Exception as e:
-            self.status_box.value = tag + "LINE pick error: " + type(e).__name__ + " " + str(e)
+            self.status_box.value = "LINE pick error: " + type(e).__name__ + " " + str(e)
             ulog("Model3DPage: line pick error: " + type(e).__name__ + " " + str(e))
             return
         if self.line_stage == "start":
             self.line_start_point = point
             self.line_stage = "end"
             self._redraw()
-            self.status_box.value = tag + "LINE: start point set, click END point"
+            self.status_box.value = "LINE: start point set, click END point"
         else:
             self._push_undo()
             self.lines.append((self.line_start_point, point, self.current_layer))
@@ -2213,27 +3103,26 @@ class Model3DPage(Page):
             self.dialog = None
             self.line_stage = "start"
             self._redraw()
-            self.status_box.value = tag + "LINE: %s to %s" % (start_point, end_point)
+            self.status_box.value = "LINE: %s to %s" % (start_point, end_point)
 
     def _on_box_pick_touch(self, x, y):
         # BOX's "CLICK ON GRID" mode -- mirrors _on_line_pick_touch:
         # first click sets one corner, second click sets the opposite
         # corner and creates the box (on_box_create already sorts
         # whichever two corners come in into min/max order)
-        tag = "T:%d  " % self.touch_count
         if not self._in_canvas(x, y):
-            self.status_box.value = tag + "BOX: click (%d,%d) was outside the VIEW panel" % (x, y)
+            self.status_box.value = "BOX: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
         try:
             plane, point = self._plane_point_at(x, y)
         except Exception as e:
-            self.status_box.value = tag + "BOX pick error: " + type(e).__name__ + " " + str(e)
+            self.status_box.value = "BOX pick error: " + type(e).__name__ + " " + str(e)
             ulog("Model3DPage: box pick error: " + type(e).__name__ + " " + str(e))
             return
         if self.box_pick_start is None:
             self.box_pick_start = point
             self._redraw()
-            self.status_box.value = tag + "BOX: first corner set, click the OPPOSITE corner"
+            self.status_box.value = "BOX: first corner set, click the OPPOSITE corner"
         else:
             p1, p2 = self.box_pick_start, point
             corner_min = (min(p1[0], p2[0]), min(p1[1], p2[1]), min(p1[2], p2[2]))
@@ -2243,17 +3132,41 @@ class Model3DPage(Page):
             self.dialog = None
             self.box_pick_start = None
             self._redraw()
-            self.status_box.value = tag + "BOX: %s to %s" % (corner_min, corner_max)
+            self.status_box.value = "BOX: %s to %s" % (corner_min, corner_max)
+
+    def _on_circle_pick_touch(self, x, y):
+        # CIRCLE's centre-placement step -- radius/plane/snap were
+        # already confirmed back in the CIRCLE dialog (see
+        # on_confirm_circle), so a single click here places the centre
+        # and creates the circle. _plane_point_at already applies grid
+        # snapping (or not) according to SNAP TO GRID/self.snap_enabled,
+        # same as every other click-to-place tool.
+        if not self._in_canvas(x, y):
+            self.status_box.value = "CIRCLE: click (%d,%d) was outside the VIEW panel" % (x, y)
+            return
+        try:
+            plane, point = self._plane_point_at(x, y)
+        except Exception as e:
+            self.status_box.value = "CIRCLE pick error: " + type(e).__name__ + " " + str(e)
+            ulog("Model3DPage: circle pick error: " + type(e).__name__ + " " + str(e))
+            return
+        r = self._circle_pick_radius
+        self._push_undo()
+        self.circles.append((point, r, self.circle_plane, self.current_layer))
+        for p0, p1 in self._circle_centerline_segments(point, r, self.circle_plane):
+            self.lines.append((p0, p1, self.current_layer))
+        self.dialog = None
+        self._redraw()
+        self.status_box.value = "CIRCLE: centre %s r=%g %s" % (point, r, self.circle_plane)
 
     def _on_select_pick_touch(self, x, y):
-        tag = "T:%d  " % self.touch_count
         if not self._in_canvas(x, y):
-            self.status_box.value = tag + "SELECT: click (%d,%d) was outside the VIEW panel" % (x, y)
+            self.status_box.value = "SELECT: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
         try:
             hit = self._hit_test(x, y)
         except Exception as e:
-            self.status_box.value = tag + "SELECT error: " + type(e).__name__ + " " + str(e)
+            self.status_box.value = "SELECT error: " + type(e).__name__ + " " + str(e)
             ulog("Model3DPage: select error: " + type(e).__name__ + " " + str(e))
             return
         self.selected = hit
@@ -2262,9 +3175,9 @@ class Model3DPage(Page):
         self._redraw()
         if hit:
             kind, idx = hit
-            self.status_box.value = tag + "SELECTED: %s #%d" % (kind.upper(), idx + 1)
+            self.status_box.value = "SELECTED: %s #%d" % (kind.upper(), idx + 1)
         else:
-            self.status_box.value = tag + "SELECT: nothing close enough -- try clicking nearer an item"
+            self.status_box.value = "SELECT: nothing close enough -- try clicking nearer an item"
 
     def on_zoom_in(self, b):
         self.zoom = min(self.zoom * self.ZOOM_STEP, self.MAX_ZOOM)
@@ -2337,6 +3250,18 @@ class Model3DPage(Page):
         if amount <= 0:
             amount = 50.0
         amount = self._snap_length_to_grid(amount)
+
+        # re-extruding the SAME base as last time (e.g. after editing
+        # it) replaces the previous extrusion's generated geometry
+        # instead of piling up a second, stale copy alongside it --
+        # this is what makes EXTRUDE double as a "refresh"
+        refreshed = False
+        if (self._last_extrude and self._last_extrude["kind"] == kind
+                and self._last_extrude["idx"] == idx):
+            self._remove_generated(self._last_extrude["generated"])
+            refreshed = True
+        self._last_extrude = None
+
         try:
             if kind == "line":
                 p0, p1, layer = self.lines[idx]
@@ -2351,6 +3276,7 @@ class Model3DPage(Page):
             self.status_box.value = "EXTRUDE: that item no longer exists"
             return
         self._push_undo()
+        generated = []
         if kind == "line":
             # turns a line into a rectangular wall outline: the
             # original line stays as the bottom edge, a copy raised by
@@ -2360,9 +3286,13 @@ class Model3DPage(Page):
             top0 = (p0[0], p0[1], p0[2] + amount)
             top1 = (p1[0], p1[1], p1[2] + amount)
             self.lines.append((top0, top1, layer))
+            generated.append(("line", len(self.lines) - 1))
             self.lines.append((p0, top0, layer))
+            generated.append(("line", len(self.lines) - 1))
             self.lines.append((p1, top1, layer))
-            self.status_box.value = "EXTRUDE: line raised into a %gmm wall" % amount
+            generated.append(("line", len(self.lines) - 1))
+            self.status_box.value = ("EXTRUDE: wall refreshed at %gmm" if refreshed
+                                      else "EXTRUDE: line raised into a %gmm wall") % amount
         elif kind == "box":
             self.boxes[idx] = (c0, (c1[0], c1[1], c1[2] + amount), layer)
             self.status_box.value = "EXTRUDE: box height increased by %gmm" % amount
@@ -2377,11 +3307,14 @@ class Model3DPage(Page):
             top_center[axis] += amount
             top_center = tuple(top_center)
             self.circles.append((top_center, radius, plane, layer))
+            generated.append(("circle", len(self.circles) - 1))
             for angle in (0, 90, 180, 270):
                 pb = self._circle_point(center, radius, plane, angle)
                 pt = self._circle_point(top_center, radius, plane, angle)
                 self.lines.append((pb, pt, layer))
-            self.status_box.value = "EXTRUDE: circle swept into a %gmm cylinder" % amount
+                generated.append(("line", len(self.lines) - 1))
+            self.status_box.value = ("EXTRUDE: cylinder refreshed at %gmm" if refreshed
+                                      else "EXTRUDE: circle swept into a %gmm cylinder") % amount
         else:
             # same idea as circle, but only the two ends of the arc get
             # a connecting vertical, matching a LINE's wall ends
@@ -2390,13 +3323,40 @@ class Model3DPage(Page):
             top_center[axis] += amount
             top_center = tuple(top_center)
             self.arcs.append((top_center, radius, plane, a0, a1, layer))
+            generated.append(("arc", len(self.arcs) - 1))
             for angle in (a0, a1):
                 pb = self._circle_point(center, radius, plane, angle)
                 pt = self._circle_point(top_center, radius, plane, angle)
                 self.lines.append((pb, pt, layer))
-            self.status_box.value = "EXTRUDE: arc swept into a %gmm curved wall" % amount
+                generated.append(("line", len(self.lines) - 1))
+            self.status_box.value = ("EXTRUDE: curved wall refreshed at %gmm" if refreshed
+                                      else "EXTRUDE: arc swept into a %gmm curved wall") % amount
+        if generated:
+            # not tracked for box -- it extrudes itself in place, no
+            # separate generated pieces to refresh or highlight
+            self._last_extrude = {"kind": kind, "idx": idx, "generated": generated}
         self.selected = None
         self._redraw()
+
+    def _remove_generated(self, generated):
+        # deletes previously-generated extrude geometry (see
+        # on_confirm_extrude/_last_extrude) -- highest index first
+        # within each kind, so removing one doesn't shift the index of
+        # another not-yet-removed entry from the same list. Assumes
+        # nothing else has inserted/deleted in boxes/lines/circles/arcs
+        # since these indices were recorded (true for the EXTRUDE ->
+        # EDIT base -> EXTRUDE again "refresh" workflow this exists
+        # for; _last_extrude gets cleared on DELETE/UNDO/REDO/NEW FILE/
+        # OPEN specifically because that assumption stops holding)
+        by_kind = {}
+        for k, i in generated:
+            by_kind.setdefault(k, []).append(i)
+        collections = {"line": self.lines, "box": self.boxes, "circle": self.circles, "arc": self.arcs}
+        for k, indices in by_kind.items():
+            collection = collections[k]
+            for i in sorted(indices, reverse=True):
+                if 0 <= i < len(collection):
+                    del collection[i]
 
     def on_edit_pressed(self, b):
         if self.selected is None:
@@ -2490,6 +3450,8 @@ class Model3DPage(Page):
         # index can easily point at a different item (or nothing) once
         # the lists it indexes into have just changed underneath it
         self.selected = None
+        # same reasoning for any tracked "last extrude" indices
+        self._last_extrude = None
         self._redraw()
         self.status_box.value = "Undone"
 
@@ -2500,6 +3462,7 @@ class Model3DPage(Page):
         self.undo_stack.append(self._model_snapshot())
         self._restore_snapshot(self.redo_stack.pop())
         self.selected = None
+        self._last_extrude = None
         self._redraw()
         self.status_box.value = "Redone"
 
