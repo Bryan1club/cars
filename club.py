@@ -1513,7 +1513,7 @@ class Page:
 ICON_NAMES = {
     "NEW FILE": "new_file", "OPEN": "open", "SAVE AS": "save_as", "DELETE": "delete",
     "SELECT": "select", "LINE": "line", "CTR LINE": "centerline", "BOX": "box",
-    "CIRCLE": "circle", "ARC": "arc", "GRID": "grid",
+    "CIRCLE": "circle", "ARC": "arc", "MULTI LINE": "multi_line", "RADIUS": "radius", "GRID": "grid",
 }
 
 # topic -> (page title, [(button/field label, what it does), ...])
@@ -1614,7 +1614,7 @@ HELP_TEXT = {
         ("MENU", "Return to the main menu."),
     ]),
     "model3d": ("3D Model Editor", [
-        ("NEW FILE", "Type X/Y/Z size in mm and CREATE a box -- clears everything else currently modelled."),
+        ("NEW FILE", "Clears everything currently modelled and starts from a blank canvas (undoable)."),
         ("OPEN", "Pick a saved model from the list and load it into the viewer."),
         ("SAVE AS", "Type a name and save everything currently modelled to the SD card."),
         ("DELETE", "If something is SELECTED (highlighted red), removes just that item (undoable). Otherwise, pick a saved model from the list and remove that file."),
@@ -1625,6 +1625,8 @@ HELP_TEXT = {
         ("BOX", "Choose CLICK ON GRID (tap one corner then the opposite corner in the VIEW panel) or TYPE VALUES (enter X/Y/Z numbers)."),
         ("CIRCLE", "Enter a centre point and radius; tap the plane button to cycle XY/XZ/YZ. Adds a selectable centre-mark crosshair through the middle too."),
         ("ARC", "Same as CIRCLE plus a start/end angle in degrees, swept counter-clockwise."),
+        ("MULTI LINE", "Type how many points (3+), then click each one in the VIEW panel in order -- the last point connects back to the first, forming a closed shape (e.g. a star). SELECT + EXTRUDE turns it into a solid, not just an outline."),
+        ("RADIUS", "Click two BOX walls that meet at a right angle (e.g. two adjacent enclosure walls), then give a radius in mm -- rounds that outer corner, trimming both walls and filling the gap with a solid quarter-round. Click the SAME wall twice instead to round one of its own corners (e.g. a flat base plate)."),
         ("GRID", "Set a spacing, extent, plane (tap to cycle XY/XZ/YZ), and position along that plane's normal axis (e.g. Y for an XZ 'vertical' grid, to line it up with a wall). Replaces any existing grid. Once set, every typed X/Y/Z/radius/angle value in every dialog rounds to this spacing."),
         ("VIEW panel", "Rotatable view of everything modelled -- X is red, Y is green, Z is blue, all from the origin marked 0,0."),
         ("+ / - / RST", "Zoom in, zoom out, or reset the view back to its default position, zoom, and rotation."),
@@ -1634,7 +1636,7 @@ HELP_TEXT = {
         ("WIRE", "Show or hide LINE/CIRCLE/ARC entries -- BOX, the grid, and the axis arrows stay visible either way."),
         ("GRID button", "Below the mouse position readout -- shows or hides the GRID dots on their own, independent of WIRE."),
         ("SNAP", "Master on/off for grid snapping -- when off, every typed value and click position is used exactly as entered even if a GRID is set."),
-        ("EXTRUDE", "SELECT anything first, then give a height in mm: LINE becomes a wall, BOX grows taller, CIRCLE becomes a cylinder, ARC becomes a curved wall."),
+        ("EXTRUDE", "SELECT anything first, then give a height in mm: LINE becomes a wall, BOX grows taller, CIRCLE becomes a cylinder, ARC becomes a curved wall, MULTI LINE becomes a solid extruded shape."),
         ("EDIT", "SELECT anything first -- opens its points/radius/angles pre-filled so you can fix a mistake without deleting and redrawing it. Also has its own DELETE THIS ITEM button."),
         ("UNDO / REDO", "Step back or forward through NEW FILE/OPEN/LINE/BOX/CIRCLE/ARC/GRID/EXTRUDE/EDIT changes."),
         ("MENU", "Return to the main menu."),
@@ -2553,7 +2555,14 @@ def handle_upload_connection(conn):
         if not filename:
             filename = "upload_" + stamp().replace(" ", "_").replace(":", "") + ".jpg"
         length = int(headers.get("content-length", "0"))
-        dest_dir = EXPORT_DIR if filename.lower().endswith(".csv") else PHOTO_DIR
+        if filename.lower().endswith(".csv"):
+            dest_dir = EXPORT_DIR
+        elif filename.lower().endswith(".stl"):
+            dest_dir = STL_DIR
+        elif filename.lower().endswith(".model"):
+            dest_dir = MODELS_DIR
+        else:
+            dest_dir = PHOTO_DIR
         ulog("handle_upload: receiving " + filename + " length=" + str(length) + " -> " + dest_dir)
         receive_file_to(conn, rest, length, filename, dest_dir)
         actual = 0
@@ -3396,6 +3405,11 @@ class CalculatorPage(Page):
 #   LINE x0 y0 z0 x1 y1 z1 layer       -- endpoints
 #   CIRCLE cx cy cz radius plane layer -- plane is XY/XZ/YZ
 #   ARC cx cy cz radius plane start end layer  -- start/end in degrees
+#   POLY plane height n x0 y0 z0 x1 y1 z1 ... layer  -- MULTI LINE's
+#     closed n-point outline (last point implicitly connects back to
+#     the first); height is 0 until EXTRUDE gives it one, at which
+#     point it exports as a solid prism rather than just an outline
+#     (see _poly_solid_triangles)
 #   GRID plane spacing extent_i extent_j [position]  -- at most one per
 #     file, no layer (it's a reference, not something you select);
 #     extent_i/extent_j are along the plane's two axes in AXIS_NAMES
@@ -3412,7 +3426,7 @@ class CalculatorPage(Page):
 # .model files aren't worth carrying forward -- but BOX/LINE/CIRCLE/ARC
 # still parse without their newest field(s), defaulting to "Layer1", so
 # v2 files still open rather than silently losing content.
-def serialize_model(boxes, lines, circles, arcs, grid, layers, layer_visible):
+def serialize_model(boxes, lines, circles, arcs, polys, grid, layers, layer_visible):
     out = []
     for (c0, c1, layer) in boxes:
         out.append("BOX %g %g %g %g %g %g %s" % (c0[0], c0[1], c0[2], c1[0], c1[1], c1[2], layer))
@@ -3422,6 +3436,9 @@ def serialize_model(boxes, lines, circles, arcs, grid, layers, layer_visible):
         out.append("CIRCLE %g %g %g %g %s %s" % (c[0], c[1], c[2], r, plane, layer))
     for (c, r, plane, a0, a1, layer) in arcs:
         out.append("ARC %g %g %g %g %s %g %g %s" % (c[0], c[1], c[2], r, plane, a0, a1, layer))
+    for (points, plane, height, layer) in polys:
+        coords = " ".join("%g %g %g" % (p[0], p[1], p[2]) for p in points)
+        out.append("POLY %s %g %d %s %s" % (plane, height, len(points), coords, layer))
     if grid:
         plane, spacing, extent_i, extent_j, position = grid
         out.append("GRID %s %g %g %g %g" % (plane, spacing, extent_i, extent_j, position))
@@ -3431,7 +3448,7 @@ def serialize_model(boxes, lines, circles, arcs, grid, layers, layer_visible):
 
 
 def parse_model(text):
-    boxes, lines, circles, arcs = [], [], [], []
+    boxes, lines, circles, arcs, polys = [], [], [], [], []
     grid = None
     layers = []
     layer_visible = {}
@@ -3469,6 +3486,15 @@ def parse_model(text):
         elif parts[0] == "ARC" and len(parts) >= 8:
             arcs.append(((float(parts[1]), float(parts[2]), float(parts[3])),
                          float(parts[4]), parts[5], float(parts[6]), float(parts[7]), "Layer1"))
+        elif parts[0] == "POLY" and len(parts) >= 4:
+            plane = parts[1]
+            height = float(parts[2])
+            n = int(parts[3])
+            need = 4 + n * 3
+            if n >= 3 and len(parts) >= need + 1:
+                pts = [(float(parts[4 + k * 3]), float(parts[5 + k * 3]), float(parts[6 + k * 3]))
+                       for k in range(n)]
+                polys.append((pts, plane, height, parts[need]))
         elif parts[0] == "GRID" and len(parts) >= 6:
             grid = (parts[1], float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5]))
         elif parts[0] == "GRID" and len(parts) >= 5:
@@ -3482,10 +3508,10 @@ def parse_model(text):
     if not layers:
         layers = ["Layer1"]
         layer_visible = {"Layer1": True}
-    return boxes, lines, circles, arcs, grid, layers, layer_visible
+    return boxes, lines, circles, arcs, polys, grid, layers, layer_visible
 
 
-def save_model_file(name, boxes, lines, circles, arcs, grid, layers, layer_visible):
+def save_model_file(name, boxes, lines, circles, arcs, polys, grid, layers, layer_visible):
     try:
         os.mkdir(MODELS_DIR)
     except OSError:
@@ -3493,7 +3519,7 @@ def save_model_file(name, boxes, lines, circles, arcs, grid, layers, layer_visib
     path = MODELS_DIR + "/" + name + ".model"
     f = open(path, "w")
     try:
-        f.write(serialize_model(boxes, lines, circles, arcs, grid, layers, layer_visible))
+        f.write(serialize_model(boxes, lines, circles, arcs, polys, grid, layers, layer_visible))
     finally:
         f.close()
     return path
@@ -3737,6 +3763,281 @@ def _triangle_normal(p0, p1, p2):
     return _v_normalize(_v_cross(_v_sub(p1, p0), _v_sub(p2, p0)))
 
 
+# --- MULTI LINE / POLY solid extrude: unlike LINE/CIRCLE/ARC (hollow
+# struts, see the module comment above), a closed POLY shape gets a
+# genuinely solid prism -- a triangulated flat cap top and bottom plus
+# straight side walls -- so EXTRUDE on it (e.g. a hand-placed star
+# outline) produces something actually printable, not another
+# wireframe. Ear-clipping handles concave outlines like a star fine;
+# it only assumes the polygon is simple (edges don't cross themselves).
+def _polygon_signed_area2d(pts2d):
+    area = 0.0
+    n = len(pts2d)
+    for i in range(n):
+        u0, v0 = pts2d[i]
+        u1, v1 = pts2d[(i + 1) % n]
+        area += u0 * v1 - u1 * v0
+    return area * 0.5
+
+
+def _point_in_triangle2d(p, a, b, c):
+    def sign(p1, p2, p3):
+        return (p1[0] - p3[0]) * (p2[1] - p3[1]) - (p2[0] - p3[0]) * (p1[1] - p3[1])
+    d1 = sign(p, a, b)
+    d2 = sign(p, b, c)
+    d3 = sign(p, c, a)
+    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+    return not (has_neg and has_pos)
+
+
+def _ear_clip_triangulate(pts2d):
+    # simple (non-self-intersecting) polygon, any winding -- returns a
+    # list of (i, j, k) index-triples into pts2d. Degenerates
+    # gracefully (returns whatever it managed) rather than raising on
+    # a shape it can't fully clip, since a slightly imperfect cap
+    # beats no export at all
+    n = len(pts2d)
+    if n < 3:
+        return []
+    order = list(range(n)) if _polygon_signed_area2d(pts2d) >= 0 else list(range(n - 1, -1, -1))
+    triangles = []
+    guard = 0
+    while len(order) > 3 and guard < 400:
+        guard += 1
+        ear_found = False
+        m = len(order)
+        for k in range(m):
+            ia, ib, ic = order[(k - 1) % m], order[k], order[(k + 1) % m]
+            a, b, c = pts2d[ia], pts2d[ib], pts2d[ic]
+            cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            if cross <= 0:
+                continue  # reflex or degenerate vertex, not a valid ear tip
+            is_ear = True
+            for other in order:
+                if other in (ia, ib, ic):
+                    continue
+                if _point_in_triangle2d(pts2d[other], a, b, c):
+                    is_ear = False
+                    break
+            if is_ear:
+                triangles.append((ia, ib, ic))
+                del order[k]
+                ear_found = True
+                break
+        if not ear_found:
+            break  # degenerate/self-intersecting input; use what we have
+    if len(order) == 3:
+        triangles.append((order[0], order[1], order[2]))
+    return triangles
+
+
+def _poly_solid_triangles(points, i, j, axis, height):
+    # points: closed loop, all sharing the plane's constant axis (i, j
+    # are the two in-plane indices, axis the extrude direction, same
+    # convention as Model3DPage.PLANE_AXES/_plane_normal_axis)
+    n = len(points)
+    if n < 3:
+        return []
+    pts2d = [(p[i], p[j]) for p in points]
+    tris2d = _ear_clip_triangulate(pts2d)
+    if not tris2d:
+        return []
+
+    def lift(p, amount):
+        q = list(p)
+        q[axis] += amount
+        return tuple(q)
+
+    top_points = [lift(p, height) for p in points]
+
+    # the bottom cap must face -axis (outward/down) and the top +axis
+    # -- checked against the actual first triangle produced rather
+    # than derived by hand, since ear-clipping's internal handling of
+    # CW vs CCW input makes the "obvious" formula wrong for some of
+    # the three planes (confirmed by testing all three against an
+    # outward-normal check before trusting this)
+    ia0, ib0, ic0 = tris2d[0]
+    bottom_reversed = _triangle_normal(points[ia0], points[ib0], points[ic0])[axis] > 0
+    input_reversed = _polygon_signed_area2d(pts2d) < 0
+
+    triangles = []
+    for (ia, ib, ic) in tris2d:
+        if bottom_reversed:
+            triangles.append((points[ia], points[ic], points[ib]))
+        else:
+            triangles.append((points[ia], points[ib], points[ic]))
+    for (ia, ib, ic) in tris2d:
+        if bottom_reversed:
+            triangles.append((top_points[ia], top_points[ib], top_points[ic]))
+        else:
+            triangles.append((top_points[ia], top_points[ic], top_points[ib]))
+    # side walls -- judged by the ORIGINAL input's own winding, not
+    # bottom_reversed (ear-clipping already normalises CW input to CCW
+    # internally, so bottom_reversed alone doesn't tell us which way
+    # points[e]/points[e+1] actually run)
+    for e in range(n):
+        p0b, p1b = points[e], points[(e + 1) % n]
+        p0t, p1t = top_points[e], top_points[(e + 1) % n]
+        if bottom_reversed != input_reversed:
+            triangles.append((p0b, p1b, p1t))
+            triangles.append((p0b, p1t, p0t))
+        else:
+            triangles.append((p1b, p0b, p0t))
+            triangles.append((p1b, p0t, p1t))
+    return triangles
+
+
+# --- RADIUS: rounds the outer corner where two BOX walls meet at a
+# right angle -- e.g. two adjacent walls of a printed enclosure. Only
+# handles this one case (two axis-aligned walls sharing a full-height
+# vertical edge), not arbitrary object pairs or box-to-box fillets in
+# general, which would need real solid boolean operations -- this
+# instead trims both walls back from the shared corner and fills the
+# gap with a quarter-cylinder POLY (reusing _poly_solid_triangles), so
+# no new export code was needed for the actual solid.
+def _wall_corner_info(boxA, boxB):
+    # boxA/boxB: ((x0,y0,z0),(x1,y1,z1)) already normalized so
+    # c0[i] <= c1[i]. Returns None if these don't look like two
+    # perpendicular walls of the same height sharing an outer corner.
+    a0, a1 = boxA
+    b0, b1 = boxB
+    if abs(a0[2] - b0[2]) > 1e-6 or abs(a1[2] - b1[2]) > 1e-6:
+        return None  # different height ranges -- not matching walls
+    aw = (a1[0] - a0[0], a1[1] - a0[1])
+    bw = (b1[0] - b0[0], b1[1] - b0[1])
+    thin_a = 0 if aw[0] < aw[1] else 1
+    thin_b = 0 if bw[0] < bw[1] else 1
+    if thin_a == thin_b:
+        return None  # parallel (or both square) -- not a corner pair
+    long_a, long_b = 1 - thin_a, 1 - thin_b
+    a_min, a_max = [a0[0], a0[1]], [a1[0], a1[1]]
+    b_min, b_max = [b0[0], b0[1]], [b1[0], b1[1]]
+
+    # which end of A's long axis does B's thin slab sit nearest?
+    b_thin_center = (b_min[thin_b] + b_max[thin_b]) / 2.0
+    a_at_start = abs(b_thin_center - a_min[long_a]) <= abs(b_thin_center - a_max[long_a])
+    a_corner_coord = a_min[long_a] if a_at_start else a_max[long_a]
+
+    # which end of B's long axis does A's thin slab sit nearest?
+    a_thin_center = (a_min[thin_a] + a_max[thin_a]) / 2.0
+    b_at_start = abs(a_thin_center - b_min[long_b]) <= abs(a_thin_center - b_max[long_b])
+    b_corner_coord = b_min[long_b] if b_at_start else b_max[long_b]
+
+    corner = [0.0, 0.0]
+    corner[long_a] = a_corner_coord   # same physical axis as thin_b
+    corner[thin_a] = b_corner_coord   # same physical axis as long_b
+
+    a_outer_at_min = abs(a_min[thin_a] - corner[thin_a]) < abs(a_max[thin_a] - corner[thin_a])
+
+    return {
+        "corner_xy": tuple(corner), "z0": a0[2], "z1": a1[2],
+        "long_a": long_a, "thin_a": thin_a, "a_at_start": a_at_start, "a_outer_at_min": a_outer_at_min,
+        "long_b": long_b, "thin_b": thin_b, "b_at_start": b_at_start,
+    }
+
+
+def _wall_radius_pie(boxA, boxB, radius):
+    # returns (new_boxA, new_boxB, pie_points, wall_height), or raises
+    # ValueError if these boxes aren't a valid corner pair or the
+    # radius doesn't fit -- pie_points is a closed loop (centre point
+    # plus an arc) ready to hand straight to a POLY entry, already
+    # "extruded" (its height is the wall height, not 0) since it's a
+    # real 3D wall from the moment it's created, not a flat sketch
+    info = _wall_corner_info(boxA, boxB)
+    if info is None:
+        raise ValueError("these two boxes don't share a vertical outer edge")
+    a0, a1 = [list(boxA[0]), list(boxA[1])]
+    b0, b1 = [list(boxB[0]), list(boxB[1])]
+    la, ta = info["long_a"], info["thin_a"]
+    lb = info["long_b"]
+    a_len = a1[la] - a0[la]
+    b_len = b1[lb] - b0[lb]
+    if radius <= 0 or radius >= a_len or radius >= b_len:
+        raise ValueError("radius too large for one of these walls")
+
+    dir_a = 1.0 if info["a_at_start"] else -1.0
+    if info["a_at_start"]:
+        a0[la] += radius
+    else:
+        a1[la] -= radius
+    if info["b_at_start"]:
+        b0[lb] += radius
+    else:
+        b1[lb] -= radius
+
+    corner = list(info["corner_xy"])
+    in_dir_a = 1.0 if info["a_outer_at_min"] else -1.0
+    center = [0.0, 0.0]
+    center[la] = corner[la] + dir_a * radius
+    center[ta] = corner[ta] + in_dir_a * radius
+
+    # the two points where the arc meets each (now-trimmed) wall end --
+    # each shares the centre's long-axis position but stays out at the
+    # OTHER wall's untrimmed outer face on the thin axis
+    edge_a_pt = [0.0, 0.0]
+    edge_a_pt[la] = center[la]
+    edge_a_pt[ta] = corner[ta]
+    edge_b_pt = [0.0, 0.0]
+    edge_b_pt[la] = corner[la]
+    edge_b_pt[ta] = center[ta]
+
+    def ang(pt):
+        return math.degrees(math.atan2(pt[1] - center[1], pt[0] - center[0]))
+    a0deg, a1deg = ang(edge_b_pt), ang(edge_a_pt)
+    delta = (a1deg - a0deg + 180) % 360 - 180  # shortest signed turn, always the 90deg way
+
+    z0, z1 = info["z0"], info["z1"]
+    segs = max(2, int(round(8 * abs(delta) / 90.0)))
+    pie_points = [(center[0], center[1], z0)]
+    for i in range(segs + 1):
+        deg = math.radians(a0deg + delta * i / segs)
+        pie_points.append((center[0] + radius * math.cos(deg), center[1] + radius * math.sin(deg), z0))
+
+    return (tuple(a0), tuple(a1)), (tuple(b0), tuple(b1)), pie_points, (z1 - z0)
+
+
+def _box_corner_pie(box, x_side, y_side, radius):
+    # rounds ONE box's own corner directly -- x_side/y_side are each
+    # "min" or "max", picking which of its 4 vertical corners. Same
+    # trim-and-fill-with-a-quarter-cylinder idea as _wall_radius_pie,
+    # just without needing a second box to find the corner from.
+    c0, c1 = list(box[0]), list(box[1])
+    x_len, y_len = c1[0] - c0[0], c1[1] - c0[1]
+    if radius <= 0 or radius >= x_len or radius >= y_len:
+        raise ValueError("radius too large for this box")
+    corner_x = c0[0] if x_side == "min" else c1[0]
+    corner_y = c0[1] if y_side == "min" else c1[1]
+    dir_x = 1.0 if x_side == "min" else -1.0
+    dir_y = 1.0 if y_side == "min" else -1.0
+    if x_side == "min":
+        c0[0] += radius
+    else:
+        c1[0] -= radius
+    if y_side == "min":
+        c0[1] += radius
+    else:
+        c1[1] -= radius
+
+    center = (corner_x + dir_x * radius, corner_y + dir_y * radius)
+    edge_x_pt = (center[0], corner_y)   # meets the X-trimmed edge, at the untrimmed Y extreme
+    edge_y_pt = (corner_x, center[1])   # meets the Y-trimmed edge, at the untrimmed X extreme
+
+    def ang(pt):
+        return math.degrees(math.atan2(pt[1] - center[1], pt[0] - center[0]))
+    a0deg, a1deg = ang(edge_y_pt), ang(edge_x_pt)
+    delta = (a1deg - a0deg + 180) % 360 - 180
+
+    z0, z1 = box[0][2], box[1][2]
+    segs = max(2, int(round(8 * abs(delta) / 90.0)))
+    pie_points = [(center[0], center[1], z0)]
+    for i in range(segs + 1):
+        deg = math.radians(a0deg + delta * i / segs)
+        pie_points.append((center[0] + radius * math.cos(deg), center[1] + radius * math.sin(deg), z0))
+
+    return (tuple(c0), tuple(c1)), pie_points, (z1 - z0)
+
+
 STL_DIR = "/sd/stl"
 
 
@@ -3793,7 +4094,7 @@ class Model3DPage(Page):
     # to keep fitting more buttons in the same panel height as they've
     # been added.
     COMMANDS = ("NEW FILE", "OPEN", "SAVE AS", "DELETE", "SELECT", "LINE", "CTR LINE",
-                "BOX", "CIRCLE", "ARC", "GRID", "TEMPLATE")
+                "BOX", "CIRCLE", "ARC", "MULTI LINE", "RADIUS", "GRID", "TEMPLATE")
     CMD_BTN_H = 26  # shrunk again (30->26, icons 22->18px) to fit SELECT as an 11th button
     CMD_BTN_GAP = 5
 
@@ -3960,14 +4261,25 @@ class Model3DPage(Page):
         # reads must exist before the first build() call -- same
         # AttributeError trap CalculatorPage and the old Model3DPage
         # both had to work around
-        self.dialog = None        # None, "newfile", "open", "saveas", "delete", "line",
+        self.dialog = None        # None, "open", "saveas", "delete", "line",
                                    # "box", "circle", or "arc"
         self.model_name = "mycar"
         self.stl_strut_thickness = 4.0  # mm -- default cross-section for solidified LINE/CIRCLE/ARC edges
+        self.last_stl_path = None    # /sd/stl/<name>.stl of the most recent EXPORT STL, for SEND TO BOARD
+        self.last_stl_name = None
+        self.last_model_path = None  # /sd/models/<name>.model of the most recent SAVE, for SEND TO BOARD
+        self.last_model_name = None
         self.boxes = []             # list of ((x0,y0,z0), (x1,y1,z1)) opposite corners
         self.lines = []             # list of ((x0,y0,z0), (x1,y1,z1)) segments
         self.circles = []           # list of ((cx,cy,cz), radius, plane)
         self.arcs = []               # list of ((cx,cy,cz), radius, plane, start_deg, end_deg)
+        self.polys = []              # list of (points, plane, extrude_height, layer) -- see MULTI LINE
+        self.multiline_points = []   # points placed so far in the current MULTI LINE pick
+        self.multiline_target = 0    # how many points MULTI LINE is waiting for
+        self.radius_pick_a = None    # index into self.boxes of RADIUS's first picked wall
+        self.radius_pick_b = None    # index into self.boxes of RADIUS's second picked wall
+        self.radius_corner_side = None  # (x_side, y_side) once a single box's own corner is picked
+        self._radius_dialog_message = ""
 
         self.line_start_point = None
         self.line_stage = "start"  # "start" or "end", within the LINE dialog
@@ -4100,7 +4412,8 @@ class Model3DPage(Page):
         return self.next
 
     def _poll_live_mouse(self):
-        if self.dialog not in (None, "line_pick", "select_pick", "box_pick", "circle_pick"):
+        if self.dialog not in (None, "line_pick", "select_pick", "box_pick", "circle_pick", "multiline_pick",
+                                "radius_pick_a", "radius_pick_b", "radius_pick_corner"):
             # no mouse_box on any other (modal) dialog -- see _build_main
             return
         try:
@@ -4135,9 +4448,7 @@ class Model3DPage(Page):
         g.caption(320, self.INNER_Y0 + 6, "3D Model Editor", fg=WHITE, bg=self.BLACK, font=3, just="CT")
         self.help_button(g, "model3d", "model3d")
 
-        if self.dialog == "newfile":
-            self._build_newfile_dialog(g)
-        elif self.dialog == "open":
+        if self.dialog == "open":
             self._build_open_dialog(g)
         elif self.dialog == "saveas":
             self._build_saveas_dialog(g)
@@ -4157,6 +4468,10 @@ class Model3DPage(Page):
             self._build_circle_dialog(g)
         elif self.dialog == "arc":
             self._build_arc_dialog(g)
+        elif self.dialog == "multiline":
+            self._build_multiline_dialog(g)
+        elif self.dialog == "radius":
+            self._build_radius_dialog(g)
         elif self.dialog == "grid":
             self._build_grid_dialog(g)
         elif self.dialog == "extrude":
@@ -4176,7 +4491,9 @@ class Model3DPage(Page):
         elif self.dialog == "template_new":
             self._build_template_new_dialog(g)
         elif (self.dialog == "line_pick" or self.dialog == "select_pick" or self.dialog == "box_pick"
-              or self.dialog == "circle_pick"):
+              or self.dialog == "circle_pick" or self.dialog == "multiline_pick"
+              or self.dialog == "radius_pick_a" or self.dialog == "radius_pick_b"
+              or self.dialog == "radius_pick_corner"):
             # reuses the normal main layout (canvas, zoom, D-pad, all
             # of it) rather than a modal -- picking points/elements
             # needs the wireframe/grid actually visible and clickable,
@@ -4188,9 +4505,10 @@ class Model3DPage(Page):
     # command name -> its real dialog key, used once the CONFIRM popup
     # (see on_command / on_confirm_command) is accepted
     COMMAND_DIALOG = {
-        "NEW FILE": "newfile", "OPEN": "open", "SAVE AS": "saveas", "DELETE": "delete",
+        "OPEN": "open", "SAVE AS": "saveas", "DELETE": "delete",
         "SELECT": "select_pick", "LINE": "line_choice", "CTR LINE": "centerline", "BOX": "box_choice",
-        "CIRCLE": "circle", "ARC": "arc", "GRID": "grid", "TEMPLATE": "template",
+        "CIRCLE": "circle", "ARC": "arc", "MULTI LINE": "multiline", "RADIUS": "radius_pick_a",
+        "GRID": "grid", "TEMPLATE": "template",
     }
 
     def _build_main(self, g):
@@ -4229,6 +4547,16 @@ class Model3DPage(Page):
             self.status_box.value = "BOX: click %s corner in VIEW (%s) -- pick another command to cancel" % (verb, snap_status)
         elif self.dialog == "circle_pick":
             self.status_box.value = "CIRCLE: click centre in VIEW (%s) -- pick another command to cancel" % snap_status
+        elif self.dialog == "multiline_pick":
+            self.status_box.value = ("MULTI LINE: click point %d/%d in VIEW (%s) -- pick another command to cancel"
+                                      % (len(self.multiline_points) + 1, self.multiline_target, snap_status))
+        elif self.dialog == "radius_pick_a":
+            self.status_box.value = "RADIUS: click the FIRST wall in VIEW -- pick another command to cancel"
+        elif self.dialog == "radius_pick_b":
+            self.status_box.value = ("RADIUS: click the SECOND wall (meeting the first), or click the SAME wall "
+                                      "again to round one of its own corners")
+        elif self.dialog == "radius_pick_corner":
+            self.status_box.value = "RADIUS: click near the CORNER of that box to round -- pick another command to cancel"
 
         # temporary readout so mouse/touch input can be confirmed working
         # on real hardware independently of the command buttons above --
@@ -4346,6 +4674,26 @@ class Model3DPage(Page):
             except Exception as e:
                 ulog("Model3DPage: box start marker draw error: " + type(e).__name__ + " " + str(e))
 
+        if self.dialog == "multiline_pick" and self.multiline_points:
+            # shows the points placed so far, connected in order -- the
+            # only feedback available between clicks (no live "follows
+            # the mouse" segment, matching every other click-to-place
+            # tool on this hardware -- see the on_touch drag caveat)
+            try:
+                fb = hdmi.fb()
+                projected = [self._project(p[0], p[1], p[2], self._last_scale,
+                                            self._last_origin[0], self._last_origin[1])
+                             for p in self.multiline_points]
+                for k in range(len(projected) - 1):
+                    s0, s1 = projected[k], projected[k + 1]
+                    self._clipped_line(fb, s0[0], s0[1], s1[0], s1[1], self.CIRCLE_PREVIEW_COLOR)
+                sx, sy = projected[-1]
+                r = 5
+                self._clipped_line(fb, sx - r, sy, sx + r, sy, RED)
+                self._clipped_line(fb, sx, sy - r, sx, sy + r, RED)
+            except Exception as e:
+                ulog("Model3DPage: multiline marker draw error: " + type(e).__name__ + " " + str(e))
+
     def _draw_command_icons(self, icon_slots):
         # rendered to 26x26 BMP via Inkscape + Pillow, not yet confirmed
         # against real hardware: bmp colour depth/dithering on this
@@ -4455,6 +4803,15 @@ class Model3DPage(Page):
         for (c, r, plane, a0, a1, layer) in self.arcs:
             if self.layer_visible.get(layer, True):
                 pts.extend(self._circle_bounds_points(c, r, plane))
+        for (points, plane, height, layer) in self.polys:
+            if self.layer_visible.get(layer, True):
+                pts.extend(points)
+                if height:
+                    axis = self._plane_normal_axis(plane)
+                    for p in points:
+                        top = list(p)
+                        top[axis] += height
+                        pts.append(tuple(top))
         return pts
 
     def _axis_length(self):
@@ -4617,6 +4974,10 @@ class Model3DPage(Page):
                     if not self.layer_visible.get(layer, True):
                         continue
                     self._draw_arc(fb, c, r, plane, a0, a1, scale, ox, oy, colour=WHITE)
+                for pi, (points, plane, height, layer) in enumerate(self.polys):
+                    if not self.layer_visible.get(layer, True):
+                        continue
+                    self._draw_poly(fb, points, plane, height, scale, ox, oy)
             self._draw_selection_marker(fb, scale, ox, oy)
             if self.grid and self.grid_visible:
                 self._draw_grid_dots(fb, scale, ox, oy)
@@ -4648,6 +5009,10 @@ class Model3DPage(Page):
                 return self.circles[idx][0]
             if kind == "arc":
                 return self.arcs[idx][0]
+            if kind == "poly":
+                points = self.polys[idx][0]
+                n = len(points)
+                return tuple(sum(p[i] for p in points) / n for i in range(3))
         except IndexError:
             return None
         return None
@@ -4782,6 +5147,33 @@ class Model3DPage(Page):
                 self._clipped_line(fb, prev[0], prev[1], s[0], s[1], colour)
             prev = s
 
+    def _draw_poly(self, fb, points, plane, height, scale, ox, oy, colour=WHITE):
+        # closed n-point outline (last point implicitly back to the
+        # first); once EXTRUDEd (height > 0) also draws the raised top
+        # outline plus verticals at each point -- same wireframe
+        # language as CIRCLE/ARC's "swept into a cylinder" look, even
+        # though a POLY solidifies into a real capped mesh in the STL
+        # export rather than just hollow struts (see _poly_solid_triangles)
+        n = len(points)
+        projected = [self._project(p[0], p[1], p[2], scale, ox, oy) for p in points]
+        for k in range(n):
+            s0, s1 = projected[k], projected[(k + 1) % n]
+            self._clipped_line(fb, s0[0], s0[1], s1[0], s1[1], colour)
+        if height:
+            axis = self._plane_normal_axis(plane)
+            top_points = []
+            for p in points:
+                q = list(p)
+                q[axis] += height
+                top_points.append(tuple(q))
+            projected_top = [self._project(p[0], p[1], p[2], scale, ox, oy) for p in top_points]
+            for k in range(n):
+                s0, s1 = projected_top[k], projected_top[(k + 1) % n]
+                self._clipped_line(fb, s0[0], s0[1], s1[0], s1[1], colour)
+            for k in range(n):
+                s0, s1 = projected[k], projected_top[k]
+                self._clipped_line(fb, s0[0], s0[1], s1[0], s1[1], colour)
+
     def _draw_axes(self, g, fb, scale, ox, oy):
         # X/Y/Z reference arrows, one colour each, so the planes stay
         # readable no matter what's been modelled. When the wireframe
@@ -4855,27 +5247,8 @@ class Model3DPage(Page):
         g.start()
         self.build(g)
 
-    def _build_newfile_dialog(self, g):
-        h = 240
-        y0 = (480 - h) // 2
-        g.frame(self.DLG_X, y0, self.DLG_W, h, "NEW FILE", fg=WHITE, font=2)
-
-        defaults = (100.0, 60.0, 40.0)
-        labels = ("X (mm):", "Y (mm):", "Z (mm):")
-        boxes = []
-        for i, label in enumerate(labels):
-            ly = y0 + 40 + i * 44
-            g.caption(self.DLG_X + 20, ly + 6, label, fg=WHITE, bg=self.BLACK, font=1)
-            boxes.append(g.textbox(self.DLG_X + 130, ly, 100, 26, str(defaults[i]), font=1))
-        self.newfile_x_box, self.newfile_y_box, self.newfile_z_box = boxes
-
-        g.button(self.DLG_X + 20, y0 + 180, 120, 40, "CREATE", fg=WHITE, bg=BTN, font=2,
-                 callback=self.on_confirm_newfile)
-        g.button(self.DLG_X + 180, y0 + 180, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
-                 callback=self.on_cancel_dialog)
-
     def _build_saveas_dialog(self, g):
-        h = 280
+        h = 330
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "SAVE AS", fg=WHITE, font=2)
         g.caption(self.DLG_X + 20, y0 + 40, "Name:", fg=WHITE, bg=self.BLACK, font=1)
@@ -4891,12 +5264,17 @@ class Model3DPage(Page):
         self.stl_thickness_box = g.textbox(self.DLG_X + 20, y0 + 118, self.DLG_W - 40, 26,
                                             str(self.stl_strut_thickness), font=1)
 
-        g.button(self.DLG_X + 20, y0 + h - 110, 120, 40, "SAVE", fg=WHITE, bg=BTN, font=2,
+        g.button(self.DLG_X + 20, y0 + h - 160, 120, 40, "SAVE", fg=WHITE, bg=BTN, font=2,
                  callback=self.on_confirm_saveas)
-        g.button(self.DLG_X + 180, y0 + h - 110, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+        g.button(self.DLG_X + 180, y0 + h - 160, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
-        g.button(self.DLG_X + 20, y0 + h - 60, self.DLG_W - 40, 40, "EXPORT STL", fg=WHITE, bg=BTN, font=2,
+        g.button(self.DLG_X + 20, y0 + h - 110, self.DLG_W - 40, 40, "EXPORT STL", fg=WHITE, bg=BTN, font=2,
                  callback=self.on_confirm_export_stl)
+        # sends whatever the last EXPORT STL produced (self.last_stl_path)
+        # to every board saved on the WIFI page's forwarding list -- same
+        # pattern as PhotosPage.on_send_to_board, just for the STL_DIR file
+        g.button(self.DLG_X + 20, y0 + h - 60, self.DLG_W - 40, 40, "SEND TO BOARD", fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_send_stl_to_board)
 
     def _build_line_choice_dialog(self, g):
         h = 180
@@ -5042,6 +5420,42 @@ class Model3DPage(Page):
 
         g.button(self.DLG_X + 20, y0 + h - 50, 120, 40, "CREATE", fg=WHITE, bg=BTN, font=2,
                  callback=self.on_confirm_arc)
+        g.button(self.DLG_X + 180, y0 + h - 50, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_dialog)
+
+    MULTILINE_MAX_POINTS = 30
+
+    def _build_multiline_dialog(self, g):
+        h = 200
+        y0 = (480 - h) // 2
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "MULTI LINE" + self._grid_snap_title_suffix(), fg=WHITE, font=2)
+
+        g.caption(self.DLG_X + 20, y0 + 50, "Number of points (3-%d):" % self.MULTILINE_MAX_POINTS,
+                  fg=WHITE, bg=self.BLACK, font=1)
+        self.multiline_count_box = g.textbox(self.DLG_X + 20, y0 + 70, 100, 26, "5", font=1)
+        g.caption(self.DLG_X + 20, y0 + 106,
+                  "Click each point in the VIEW panel in order --", fg=WHITE, bg=self.BLACK, font=1)
+        g.caption(self.DLG_X + 20, y0 + 124,
+                  "the last one connects back to the first.", fg=WHITE, bg=self.BLACK, font=1)
+
+        g.button(self.DLG_X + 20, y0 + h - 50, 120, 40, "START", fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_confirm_multiline_count)
+        g.button(self.DLG_X + 180, y0 + h - 50, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_dialog)
+
+    def _build_radius_dialog(self, g):
+        h = 180
+        y0 = (480 - h) // 2
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "RADIUS", fg=WHITE, font=2)
+
+        g.caption(self.DLG_X + 20, y0 + 50, "Corner radius (mm):", fg=WHITE, bg=self.BLACK, font=1)
+        self.radius_amount_box = g.textbox(self.DLG_X + 20, y0 + 70, 100, 26, "5", font=1)
+        if self._radius_dialog_message:
+            g.caption(self.DLG_X + self.DLG_W // 2, y0 + 106, self._radius_dialog_message,
+                      fg=RED, bg=self.BLACK, font=1, just="CT")
+
+        g.button(self.DLG_X + 20, y0 + h - 50, 120, 40, "CREATE", fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_confirm_radius)
         g.button(self.DLG_X + 180, y0 + h - 50, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
 
@@ -5496,25 +5910,15 @@ class Model3DPage(Page):
         self._template_dialog_message = "Saved " + name
         self._redraw()
 
-    def on_confirm_newfile(self, b):
-        def parse(box, fallback):
-            try:
-                v = float(box.value)
-                return v if v > 0 else fallback
-            except (ValueError, TypeError):
-                return fallback
-        x = parse(self.newfile_x_box, 100.0)
-        y = parse(self.newfile_y_box, 60.0)
-        z = parse(self.newfile_z_box, 40.0)
+    def on_new_file(self):
         self._push_undo()
-        # NEW FILE starts completely fresh, not just a new box on top
-        # of whatever else was already there
-        # NEW FILE also resets layers back to a single default one --
-        # the new box always lands on it
-        self.boxes = [((0.0, 0.0, 0.0), (x, y, z), "Layer1")]
+        # NEW FILE starts completely fresh, including layers -- no
+        # starting geometry, just an empty canvas
+        self.boxes = []
         self.lines = []
         self.circles = []
         self.arcs = []
+        self.polys = []
         self.grid = None
         self.layers = ["Layer1"]
         self.current_layer = "Layer1"
@@ -5522,7 +5926,7 @@ class Model3DPage(Page):
         self.selected = None
         self.dialog = None
         self._redraw()
-        self.status_box.value = "NEW FILE: %g x %g x %g mm box" % (x, y, z)
+        self.status_box.value = "NEW FILE: blank canvas"
 
     def on_confirm_saveas(self, b):
         name = (self.saveas_box.value or "").strip()
@@ -5533,8 +5937,10 @@ class Model3DPage(Page):
             return
         self.model_name = name
         try:
-            path = save_model_file(name, self.boxes, self.lines, self.circles, self.arcs, self.grid,
-                                    self.layers, self.layer_visible)
+            path = save_model_file(name, self.boxes, self.lines, self.circles, self.arcs, self.polys,
+                                    self.grid, self.layers, self.layer_visible)
+            self.last_model_path = path
+            self.last_model_name = name + ".model"
             self.status_box.value = "Saved to " + path
         except Exception as e:
             self.status_box.value = "SAVE AS failed: " + type(e).__name__ + " " + str(e)
@@ -5569,6 +5975,19 @@ class Model3DPage(Page):
                    for i in range(segments + 1)]
             for i in range(segments):
                 triangles.extend(_strut_triangles(pts[i], pts[i + 1], strut_half_width))
+        for points, plane, height, layer in self.polys:
+            if not self.layer_visible.get(layer, True):
+                continue
+            if not height:
+                # not yet EXTRUDEd -- a flat outline has no volume to
+                # export (unlike LINE/CIRCLE/ARC, a POLY deliberately
+                # doesn't fall back to hollow struts here: the whole
+                # point of MULTI LINE + EXTRUDE is a real solid, so an
+                # un-extruded one just doesn't appear in the STL yet)
+                continue
+            i, j = self.PLANE_AXES[plane]
+            axis = self._plane_normal_axis(plane)
+            triangles.extend(_poly_solid_triangles(points, i, j, axis, height))
         return triangles
 
     def on_confirm_export_stl(self, b):
@@ -5591,10 +6010,55 @@ class Model3DPage(Page):
                 self.status_box.value = "EXPORT STL: nothing visible to export"
                 return
             path = save_stl_file(name, triangles)
+            self.last_stl_path = path
+            self.last_stl_name = name + ".stl"
             self.status_box.value = "Exported %d triangles to %s" % (len(triangles), name + ".stl")
         except Exception as e:
             self.status_box.value = "EXPORT STL failed: " + type(e).__name__ + " " + str(e)
             ulog("Model3DPage EXPORT STL error: " + type(e).__name__ + " " + str(e))
+
+    def on_send_stl_to_board(self, b):
+        # same pattern as PhotosPage.on_send_to_board: sends to every
+        # board saved on the WIFI page's forwarding list, not a single
+        # picked target. Sends BOTH the .stl (for a slicer) and the
+        # .model (so the other board can actually OPEN and keep
+        # editing it -- STL is a one-way export, not round-trippable)
+        files = []
+        if self.last_stl_path:
+            files.append((self.last_stl_path, self.last_stl_name))
+        if self.last_model_path:
+            files.append((self.last_model_path, self.last_model_name))
+        if not files:
+            self.status_box.value = "SEND TO BOARD: SAVE or EXPORT STL first"
+            return
+        names = load_forward_ips()
+        if not names:
+            self.status_box.value = "SEND TO BOARD: no boards saved yet -- add some on the WIFI page first"
+            return
+        self.dialog = None
+        self._redraw()
+        self.status_box.value = "Sending to board(s) -- screen will freeze until done"
+        sent = []
+        failed = []
+        for board_name in names:
+            ip = resolve_board_ip(board_name)
+            if not ip:
+                failed.append(board_name + " (not seen on network)")
+                continue
+            ok = True
+            for (path, filename) in files:
+                if not forward_upload(ip, path, filename):
+                    ok = False
+            if ok:
+                sent.append(board_name)
+            else:
+                failed.append(board_name)
+        names_sent = ", ".join(name for _, name in files)
+        if failed:
+            self.status_box.value = ("Sent " + names_sent + " to " + str(len(sent)) +
+                                      " board(s), FAILED: " + ", ".join(failed))
+        else:
+            self.status_box.value = "Sent " + names_sent + " to " + str(len(sent)) + " board(s)"
 
     def on_confirm_open(self, b):
         # load THEN redraw, not the other way round -- redrawing first
@@ -5608,12 +6072,13 @@ class Model3DPage(Page):
             self.status_box.value = "OPEN: nothing selected"
             return
         try:
-            boxes, lines, circles, arcs, grid, layers, layer_visible = load_model_file(name)
+            boxes, lines, circles, arcs, polys, grid, layers, layer_visible = load_model_file(name)
             self._push_undo()
             self.boxes = boxes
             self.lines = lines
             self.circles = circles
             self.arcs = arcs
+            self.polys = polys
             self.grid = grid
             self.layers = layers
             self.layer_visible = layer_visible
@@ -5662,6 +6127,60 @@ class Model3DPage(Page):
         self.box_pick_start = None
         self.dialog = "box_pick"
         self._redraw()
+
+    def on_confirm_multiline_count(self, b):
+        try:
+            n = int(float(self.multiline_count_box.value))
+        except (ValueError, TypeError):
+            n = 5
+        n = max(3, min(self.MULTILINE_MAX_POINTS, n))
+        self.multiline_target = n
+        self.multiline_points = []
+        self.dialog = "multiline_pick"
+        self._redraw()
+
+    def on_confirm_radius(self, b):
+        try:
+            radius = float(self.radius_amount_box.value)
+        except (ValueError, TypeError):
+            radius = 0.0
+        idx_a, idx_b = self.radius_pick_a, self.radius_pick_b
+        single_box = idx_a == idx_b
+        try:
+            box_a = self.boxes[idx_a]
+            box_b = box_a if single_box else self.boxes[idx_b]
+        except (IndexError, TypeError):
+            self.dialog = None
+            self.radius_pick_a = None
+            self.radius_pick_b = None
+            self._redraw()
+            self.status_box.value = "RADIUS: one of those walls no longer exists"
+            return
+        try:
+            if single_box:
+                x_side, y_side = self.radius_corner_side
+                new_a, pie_points, height = _box_corner_pie((box_a[0], box_a[1]), x_side, y_side, radius)
+                new_b = None
+            else:
+                new_a, new_b, pie_points, height = _wall_radius_pie(
+                    (box_a[0], box_a[1]), (box_b[0], box_b[1]), radius)
+        except ValueError as e:
+            self._radius_dialog_message = str(e)
+            self._redraw()
+            return
+        self._push_undo()
+        self.boxes[idx_a] = (new_a[0], new_a[1], box_a[2])
+        if not single_box:
+            self.boxes[idx_b] = (new_b[0], new_b[1], box_b[2])
+        self.polys.append((pie_points, "XY", height, box_a[2]))
+        self.radius_pick_a = None
+        self.radius_pick_b = None
+        self.radius_corner_side = None
+        self._radius_dialog_message = ""
+        self.dialog = None
+        self.selected = None
+        self._redraw()
+        self.status_box.value = "RADIUS: corner rounded to %gmm" % radius
 
     def on_box_choice_type(self, b):
         self.box_stage = "start"
@@ -5925,6 +6444,9 @@ class Model3DPage(Page):
         for arc in self.arcs:
             if arc[5] == name:
                 count += 1
+        for poly in self.polys:
+            if poly[3] == name:
+                count += 1
         return count
 
     def on_delete_layer(self, b):
@@ -5960,6 +6482,10 @@ class Model3DPage(Page):
         self.line_stage = "start"
         self.box_stage = "start"
         self.box_pick_start = None
+        self.radius_pick_a = None
+        self.radius_pick_b = None
+        self.radius_corner_side = None
+        self._radius_dialog_message = ""
         self._redraw()
 
     def _make_command_handler(self, name):
@@ -5972,11 +6498,23 @@ class Model3DPage(Page):
 
     def on_command(self, name):
         self.active_command = name
-        if name == "LINE":
+        if name == "NEW FILE":
+            self.on_new_file()
+            return
+        elif name == "LINE":
             self.line_stage = "start"
         elif name == "BOX":
             self.box_stage = "start"
             self.box_pick_start = None
+        elif name == "RADIUS":
+            # a stale self.selected from an earlier SELECT would
+            # otherwise keep drawing its marker throughout RADIUS's
+            # whole (multi-click) pick sequence -- see _draw_selection_marker
+            self.selected = None
+            self.radius_pick_a = None
+            self.radius_pick_b = None
+            self.radius_corner_side = None
+            self._radius_dialog_message = ""
         elif name == "DELETE" and self.selected is not None:
             # DELETE means "delete the selected item" whenever SELECT
             # has one highlighted -- only falls back to the saved-file
@@ -6005,7 +6543,7 @@ class Model3DPage(Page):
     def _delete_selected(self):
         kind, idx = self.selected
         collection = {"box": self.boxes, "line": self.lines,
-                      "circle": self.circles, "arc": self.arcs}[kind]
+                      "circle": self.circles, "arc": self.arcs, "poly": self.polys}[kind]
         self._push_undo()
         del collection[idx]
         self.selected = None
@@ -6090,6 +6628,23 @@ class Model3DPage(Page):
         ex, ey = px - cx, py - cy
         return math.sqrt(ex * ex + ey * ey)
 
+    def _nearest_box_corner(self, box, x, y, scale, ox, oy):
+        # which of a box's 4 vertical (full-height) edges a click
+        # landed nearest -- used by RADIUS's single-box corner pick,
+        # same nearest-in-screen-space idea as _hit_test
+        c0, c1 = box[0], box[1]
+        corners = [(c0[0], c0[1]), (c0[0], c1[1]), (c1[0], c0[1]), (c1[0], c1[1])]
+        best, best_dist = None, None
+        for (cx, cy) in corners:
+            p_bot = self._project(cx, cy, c0[2], scale, ox, oy)
+            p_top = self._project(cx, cy, c1[2], scale, ox, oy)
+            d = self._point_to_segment_dist(x, y, p_bot[0], p_bot[1], p_top[0], p_top[1])
+            if best_dist is None or d < best_dist:
+                best_dist, best = d, (cx, cy)
+        x_side = "min" if best[0] == c0[0] else "max"
+        y_side = "min" if best[1] == c0[1] else "max"
+        return x_side, y_side
+
     def _arc_hit_dist(self, x, y, center, radius, plane, a0, a1, scale, ox, oy, segments=32):
         # same chord approximation _draw_arc uses -- distance from
         # (x,y) to the nearest chord, so hit-testing matches what's
@@ -6149,6 +6704,17 @@ class Model3DPage(Page):
             if best_dist is None or d < best_dist:
                 best_dist, best = d, ("arc", ai)
 
+        for pi, (points, plane, height, layer) in enumerate(self.polys):
+            if not self.layer_visible.get(layer, True):
+                continue
+            n = len(points)
+            projected = [self._project(p[0], p[1], p[2], scale, ox, oy) for p in points]
+            for k in range(n):
+                s0, s1 = projected[k], projected[(k + 1) % n]
+                d = self._point_to_segment_dist(x, y, s0[0], s0[1], s1[0], s1[1])
+                if best_dist is None or d < best_dist:
+                    best_dist, best = d, ("poly", pi)
+
         if best_dist is not None and best_dist <= self.SELECT_THRESHOLD:
             return best
         return None
@@ -6194,6 +6760,18 @@ class Model3DPage(Page):
             return
         if self.dialog == "circle_pick":
             self._on_circle_pick_touch(x, y)
+            return
+        if self.dialog == "multiline_pick":
+            self._on_multiline_pick_touch(x, y)
+            return
+        if self.dialog == "radius_pick_a":
+            self._on_radius_pick_a_touch(x, y)
+            return
+        if self.dialog == "radius_pick_b":
+            self._on_radius_pick_b_touch(x, y)
+            return
+        if self.dialog == "radius_pick_corner":
+            self._on_radius_pick_corner_touch(x, y)
             return
         #
         # DRAG CAVEAT: panning is reconstructed from on_touch rather
@@ -6325,6 +6903,89 @@ class Model3DPage(Page):
         self._redraw()
         self.status_box.value = "CIRCLE: centre %s r=%g %s" % (point, r, self.circle_plane)
 
+    def _on_multiline_pick_touch(self, x, y):
+        # collects self.multiline_target points one click at a time,
+        # all on the same plane (whichever the active GRID is on, or
+        # XY -- same convention _plane_point_at always uses), then
+        # closes the loop into one new POLY entry -- not separate LINE
+        # segments, so it can later be SELECTed/EXTRUDEd as one shape
+        if not self._in_canvas(x, y):
+            self.status_box.value = "MULTI LINE: click (%d,%d) was outside the VIEW panel" % (x, y)
+            return
+        try:
+            plane, point = self._plane_point_at(x, y)
+        except Exception as e:
+            self.status_box.value = "MULTI LINE pick error: " + type(e).__name__ + " " + str(e)
+            ulog("Model3DPage: multiline pick error: " + type(e).__name__ + " " + str(e))
+            return
+        self.multiline_points.append(point)
+        if len(self.multiline_points) < self.multiline_target:
+            self._redraw()
+            self.status_box.value = ("MULTI LINE: point %d/%d placed, click next point"
+                                      % (len(self.multiline_points), self.multiline_target))
+            return
+        self._push_undo()
+        self.polys.append((list(self.multiline_points), plane, 0.0, self.current_layer))
+        count = len(self.multiline_points)
+        self.multiline_points = []
+        self.dialog = None
+        self._redraw()
+        self.status_box.value = ("MULTI LINE: %d-point shape added (closed) -- "
+                                  "SELECT + EXTRUDE to make it solid" % count)
+
+    def _on_radius_pick_a_touch(self, x, y):
+        if not self._in_canvas(x, y):
+            self.status_box.value = "RADIUS: click (%d,%d) was outside the VIEW panel" % (x, y)
+            return
+        hit = self._hit_test(x, y)
+        if hit is None or hit[0] != "box":
+            self.status_box.value = "RADIUS: click nearer a BOX wall"
+            return
+        self.radius_pick_a = hit[1]
+        self.dialog = "radius_pick_b"
+        self._redraw()
+        self.status_box.value = "RADIUS: first wall picked -- click the SECOND wall"
+
+    def _on_radius_pick_b_touch(self, x, y):
+        if not self._in_canvas(x, y):
+            self.status_box.value = "RADIUS: click (%d,%d) was outside the VIEW panel" % (x, y)
+            return
+        hit = self._hit_test(x, y)
+        if hit is None or hit[0] != "box":
+            self.status_box.value = "RADIUS: click nearer a BOX wall"
+            return
+        if hit[1] == self.radius_pick_a:
+            # same wall picked twice -- round one of ITS OWN corners
+            # instead of a corner shared with a second wall
+            self.dialog = "radius_pick_corner"
+            self._redraw()
+            self.status_box.value = "RADIUS: click near the CORNER of that box to round"
+            return
+        self.radius_pick_b = hit[1]
+        self.radius_corner_side = None
+        self._radius_dialog_message = ""
+        self.dialog = "radius"
+        self._redraw()
+
+    def _on_radius_pick_corner_touch(self, x, y):
+        if not self._in_canvas(x, y):
+            self.status_box.value = "RADIUS: click (%d,%d) was outside the VIEW panel" % (x, y)
+            return
+        try:
+            box = self.boxes[self.radius_pick_a]
+        except IndexError:
+            self.dialog = None
+            self.radius_pick_a = None
+            self._redraw()
+            self.status_box.value = "RADIUS: that box no longer exists"
+            return
+        self.radius_pick_b = self.radius_pick_a
+        self.radius_corner_side = self._nearest_box_corner(
+            box, x, y, self._last_scale, self._last_origin[0], self._last_origin[1])
+        self._radius_dialog_message = ""
+        self.dialog = "radius"
+        self._redraw()
+
     def _on_select_pick_touch(self, x, y):
         if not self._in_canvas(x, y):
             self.status_box.value = "SELECT: click (%d,%d) was outside the VIEW panel" % (x, y)
@@ -6423,6 +7084,8 @@ class Model3DPage(Page):
                 c0, c1, layer = self.boxes[idx]
             elif kind == "circle":
                 center, radius, plane, layer = self.circles[idx]
+            elif kind == "poly":
+                points, plane, old_height, layer = self.polys[idx]
             else:
                 center, radius, plane, a0, a1, layer = self.arcs[idx]
         except IndexError:
@@ -6461,6 +7124,14 @@ class Model3DPage(Page):
                 pt = self._circle_point(top_center, radius, plane, angle)
                 self.lines.append((pb, pt, layer))
             self.status_box.value = "EXTRUDE: circle swept into a %gmm cylinder" % amount
+        elif kind == "poly":
+            # unlike LINE/CIRCLE/ARC, this doesn't spawn sibling
+            # wireframe pieces -- the height lives directly on the
+            # POLY itself (like BOX growing in place), and it's what
+            # turns into an actual solid prism in the STL export (see
+            # _poly_solid_triangles), not another hollow strut outline
+            self.polys[idx] = (points, plane, amount, layer)
+            self.status_box.value = "EXTRUDE: MULTI LINE shape extruded to a solid %gmm high" % amount
         else:
             # same idea as circle, but only the two ends of the arc get
             # a connecting vertical, matching a LINE's wall ends
@@ -6480,6 +7151,13 @@ class Model3DPage(Page):
     def on_edit_pressed(self, b):
         if self.selected is None:
             self.status_box.value = "EDIT: SELECT an item first"
+            return
+        if self.selected[0] == "poly":
+            # arbitrary point count doesn't fit the generic fixed-field
+            # EDIT dialog every other kind uses -- DELETE and redraw is
+            # the only way to change a MULTI LINE shape's points for
+            # now; EXTRUDE still works fine on it for changing height
+            self.status_box.value = "EDIT: not supported for MULTI LINE shapes yet -- DELETE and redraw, or EXTRUDE to change height"
             return
         self.active_command = "EDIT"
         self.dialog = "edit"
@@ -6542,11 +7220,11 @@ class Model3DPage(Page):
         self._redraw()
 
     def _model_snapshot(self):
-        return (list(self.boxes), list(self.lines), list(self.circles), list(self.arcs), self.grid,
-                list(self.layers), dict(self.layer_visible), self.current_layer)
+        return (list(self.boxes), list(self.lines), list(self.circles), list(self.arcs), list(self.polys),
+                self.grid, list(self.layers), dict(self.layer_visible), self.current_layer)
 
     def _restore_snapshot(self, snapshot):
-        (self.boxes, self.lines, self.circles, self.arcs, self.grid,
+        (self.boxes, self.lines, self.circles, self.arcs, self.polys, self.grid,
          self.layers, self.layer_visible, self.current_layer) = snapshot
 
     def _push_undo(self):
@@ -6640,6 +7318,12 @@ class SDImportPage(Page):
         g.caption(320, 6, "Import from SD", fg=INK, bg=PAGE, font=3, just="CT")
         self.path_line = g.displaybox(14, 40, 600, 22, "", fg=INK, bg=PAGE, font=2)
         self.list = None
+        # picks ANY file in the browser (already-imported STL/model, a
+        # photo, whatever) and sends it to every board on the WIFI
+        # page's forwarding list -- same forward_upload/resolve_board_ip
+        # plumbing as Model3DPage's SEND TO BOARD, just not tied to
+        # "whatever this session last exported"
+        g.button(14, 372, 612, 32, "SEND TO BOARD", fg=WHITE, bg=BTN, font=2, callback=self.on_send_to_board)
         self.refresh_btn = g.button(14, 410, 150, 32, "REFRESH", fg=WHITE, bg=BTN, font=2, callback=self.on_refresh)
         self.import_btn = g.button(180, 410, 150, 32, "IMPORT", fg=WHITE, bg=BTN, font=2, callback=self.on_import)
         self.edit_btn = g.button(340, 410, 170, 32, "VIEW / EDIT", fg=WHITE, bg=BTN, font=2, callback=self.on_edit_toggle)
@@ -6759,7 +7443,7 @@ class SDImportPage(Page):
 
         if self.list is not None:
             self.g.remove(self.list)
-        self.list = self.g.listbox(14, 66, 600, 334, items, 0, font=2, callback=self.on_pick)
+        self.list = self.g.listbox(14, 66, 600, 294, items, 0, font=2, callback=self.on_pick)
         self.path_line.value = self.current_dir
         self.picked_path = ""
         self.say(str(len(dirs)) + " folder(s), " + str(len(files)) + " file(s) here")
@@ -6879,7 +7563,14 @@ class SDImportPage(Page):
         name = self.picked_path.split("/")[-1]
         low = name.lower()
         is_photo = low.endswith(".jpg") or low.endswith(".jpeg") or low.endswith(".bmp")
-        target_dir = PHOTO_DIR if is_photo else IMPORT_DIR
+        if is_photo:
+            target_dir = PHOTO_DIR
+        elif low.endswith(".stl"):
+            target_dir = STL_DIR
+        elif low.endswith(".model"):
+            target_dir = MODELS_DIR
+        else:
+            target_dir = IMPORT_DIR
         try:
             os.mkdir(target_dir)
         except OSError:
@@ -6913,6 +7604,32 @@ class SDImportPage(Page):
             self.say("Imported as " + name + " into " + target_dir)
         except OSError as e:
             self.say("Import failed: " + str(e))
+
+    def on_send_to_board(self, b):
+        if not self.picked_path:
+            self.say("Pick a file from the list first")
+            return
+        name = self.picked_path.split("/")[-1]
+        names = load_forward_ips()
+        if not names:
+            self.say("No boards saved yet -- add some on the WIFI page first")
+            return
+        self.say("Sending " + name + " -- screen will freeze until done")
+        sent = []
+        failed = []
+        for board_name in names:
+            ip = resolve_board_ip(board_name)
+            if not ip:
+                failed.append(board_name + " (not seen on network)")
+                continue
+            if forward_upload(ip, self.picked_path, name):
+                sent.append(board_name)
+            else:
+                failed.append(board_name)
+        if failed:
+            self.say("Sent " + name + " to " + str(len(sent)) + " board(s), FAILED: " + ", ".join(failed))
+        else:
+            self.say("Sent " + name + " to " + str(len(sent)) + " board(s)")
 
     def on_back(self, b):
         if self.editing:
