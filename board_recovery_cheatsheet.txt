@@ -1,0 +1,53 @@
+BOARD 3 / BOARD 4 -- MANUAL START-UP (if the screen doesn't come on by itself)
+==============================================================================
+
+Boards 1 and 2 start club.py on their own. Boards 3 and 4 currently don't --
+if either one loses power (unplugged, battery dies, knocked out at the venue)
+it will sit at a blank screen and need this manual step to bring it back.
+
+WHAT YOU NEED
+- A laptop (Windows) with PowerShell (already built in, nothing to install)
+- The USB cable that came with the board
+
+STEPS
+
+1. Plug the board into the laptop with the USB cable.
+
+2. Open PowerShell (Start menu -> type "PowerShell" -> press Enter).
+
+3. Copy and paste this ENTIRE block into the PowerShell window, then press
+   Enter. It auto-detects the board's port -- you shouldn't need to change
+   anything:
+
+   $p = (Get-PnpDevice -Class Ports -PresentOnly | Where-Object { $_.FriendlyName -match 'CH340' } | Select-Object -First 1).FriendlyName -replace '.*\((COM\d+)\).*','$1'
+   $port = New-Object System.IO.Ports.SerialPort $p,115200,None,8,One
+   $port.ReadTimeout = 3000
+   $port.Open()
+   Start-Sleep -Milliseconds 300
+   $port.DiscardInBuffer()
+   $port.Write([char]3)
+   Start-Sleep -Milliseconds 500
+   $port.ReadExisting() | Out-Null
+   $port.DiscardInBuffer()
+   $port.Write("from pcshell import run`r`nrun('/sd/club.py')`r`n")
+   Start-Sleep -Milliseconds 1500
+   Write-Output $port.ReadExisting()
+   $port.Close()
+
+4. Check the board's screen -- it should now be showing the club.py app
+   (member list / menu screen). If you see a Python error message instead
+   of the app, take a photo of it and send it over -- don't try to fix it
+   on the spot.
+
+5. Once it's running, leave the board plugged into USB power (a phone
+   charger/battery pack is fine) so it doesn't lose power again -- if it
+   does, just repeat steps 1-4.
+
+NOTES
+- This does NOT erase or change anything on the board -- it just starts
+  the app that's already there.
+- If PowerShell says "port does not exist" or nothing happens on the
+  screen, try unplugging and replugging the USB cable, wait 5 seconds,
+  then repeat step 3.
+- This is a workaround, not a fix -- the real fix (why boards 3/4 don't
+  auto-start) still needs chasing down after the demo.

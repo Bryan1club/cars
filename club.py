@@ -22,6 +22,14 @@ except ImportError:
 import struct
 import pcimage
 import ubinascii as binascii
+try:
+    import select as _select
+except ImportError:
+    _select = None
+try:
+    import json
+except ImportError:
+    import ujson as json
 from pcconfig import screen
 from pcconsole import console
 from pcgfx import WHITE, RED
@@ -243,6 +251,10 @@ def ulog(text):
 PAGE = 0x66B2FF
 INK = 0x103018
 BTN = 0x2E7D32
+DIM_BG = 0x9AA3AD  # muted background for a control that exists but isn't
+DIM_FG = 0xE0E4E8  # usable right now (e.g. PREV on page 1) -- shown in
+                    # place rather than hidden, so its position on screen
+                    # stays predictable and it's clear more exists
 
 db = None
 
@@ -432,6 +444,113 @@ def url_quote(s):
     return "".join(out)
 
 
+# forward_upload's first hardening attempt (non-blocking send() with a
+# manual retry loop) still hung the whole board TWICE, on both boards, in
+# both directions -- which points at CONNECT or the final RECV also being
+# able to block forever, not just send(), and/or this board's socket
+# implementation not raising the errno this code was watching for on a
+# would-block. select() is used instead everywhere below: it takes an
+# explicit timeout and is a much more portable way to wait for a socket
+# to be ready than trusting per-call settimeout()/errno codes, which is
+# exactly the assumption that turned out not to hold here. If `select`
+# itself isn't available on this build, each helper falls back to the
+# plain blocking call with settimeout() -- weaker, but no worse than
+# before, and never a hard import-time failure.
+_FWD_TIMEOUT = 10  # per-step (connect/send-chunk/recv) ceiling, seconds
+
+
+def _remaining_seconds(start_ms, max_seconds):
+    elapsed = time.ticks_diff(time.ticks_ms(), start_ms) / 1000
+    return max_seconds - elapsed
+
+
+def _wait_writable(s, start_ms, max_seconds):
+    if _select is None:
+        return True
+    remaining = min(_FWD_TIMEOUT, _remaining_seconds(start_ms, max_seconds))
+    if remaining <= 0:
+        return False
+    try:
+        _, w, _ = _select.select([], [s], [], remaining)
+    except Exception:
+        return True  # select not usable on this socket -- let the caller's own attempt decide
+    return bool(w)
+
+
+def _wait_readable(s, start_ms, max_seconds):
+    if _select is None:
+        return True
+    remaining = min(_FWD_TIMEOUT, _remaining_seconds(start_ms, max_seconds))
+    if remaining <= 0:
+        return False
+    try:
+        r, _, _ = _select.select([s], [], [], remaining)
+    except Exception:
+        return True
+    return bool(r)
+
+
+def _connect_bounded(s, addr, start_ms, max_seconds):
+    if _select is None:
+        s.settimeout(_FWD_TIMEOUT)
+        s.connect(addr)
+        return
+    s.setblocking(False)
+    try:
+        s.connect(addr)
+    except OSError as e:
+        if e.args[0] not in (11, 35, 115):  # EAGAIN / EWOULDBLOCK / EINPROGRESS
+            raise
+    if not _wait_writable(s, start_ms, max_seconds):
+        raise RuntimeError("connect timed out")
+    try:
+        err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+        if err:
+            raise OSError(err, "connect failed")
+    except AttributeError:
+        pass  # getsockopt/SO_ERROR not available on this port -- best effort
+    s.setblocking(True)
+
+
+def _send_all_bounded(s, data, start_ms, max_seconds):
+    s.setblocking(False)
+    try:
+        mv = memoryview(data)
+        sent = 0
+        n = len(data)
+        while sent < n:
+            if _remaining_seconds(start_ms, max_seconds) <= 0:
+                raise RuntimeError("send timed out")
+            if not _wait_writable(s, start_ms, max_seconds):
+                raise RuntimeError("send timed out waiting for socket to be writable")
+            try:
+                wrote = s.send(mv[sent:])
+                if wrote:
+                    sent += wrote
+            except OSError as e:
+                if e.args[0] not in (11, 35):  # EAGAIN / EWOULDBLOCK
+                    raise
+                if _select is None:
+                    time.sleep_ms(20)  # no select -- avoid a tight busy-loop
+    finally:
+        s.setblocking(True)
+
+
+def _recv_bounded(s, bufsize, start_ms, max_seconds):
+    s.setblocking(False)
+    try:
+        if not _wait_readable(s, start_ms, max_seconds):
+            return b""
+        try:
+            return s.recv(bufsize)
+        except OSError as e:
+            if e.args[0] in (11, 35):
+                return b""
+            raise
+    finally:
+        s.setblocking(True)
+
+
 def forward_upload(ip, path, filename, max_seconds=45):
     # re-POSTs an already-saved file to another board's /upload/
     # endpoint -- used so a "relay" board can pass new photos on to
@@ -444,47 +563,47 @@ def forward_upload(ip, path, filename, max_seconds=45):
     # connection fails outright instead of hanging indefinitely.
     ulog("forward_upload: starting, ip=" + ip + " file=" + filename)
     start = time.ticks_ms()
+    s = None
     try:
         size = os.stat(path)[6]
         ulog("forward_upload: size=" + str(size) + " connecting...")
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(10)
-        s.connect((ip, 8080))
+        _connect_bounded(s, (ip, 8080), start, max_seconds)
         ulog("forward_upload: connected, sending headers")
+        header = ("POST /upload/" + url_quote(filename) + " HTTP/1.1\r\n" +
+                   "Host: " + ip + "\r\n" +
+                   "Content-Length: " + str(size) + "\r\n" +
+                   "Connection: close\r\n\r\n")
+        _send_all_bounded(s, header.encode(), start, max_seconds)
+        ulog("forward_upload: headers sent, streaming body")
+        f = open(path, "rb")
+        sent = 0
         try:
-            header = ("POST /upload/" + url_quote(filename) + " HTTP/1.1\r\n" +
-                       "Host: " + ip + "\r\n" +
-                       "Content-Length: " + str(size) + "\r\n" +
-                       "Connection: close\r\n\r\n")
-            s.send(header.encode())
-            ulog("forward_upload: headers sent, streaming body")
-            f = open(path, "rb")
-            sent = 0
-            try:
-                while True:
-                    if time.ticks_diff(time.ticks_ms(), start) > max_seconds * 1000:
-                        raise RuntimeError("transfer exceeded " + str(max_seconds) + "s, aborting")
-                    chunk = f.read(2048)
-                    if not chunk:
-                        break
-                    s.send(chunk)
-                    sent += len(chunk)
-            finally:
-                f.close()
-            elapsed = time.ticks_diff(time.ticks_ms(), start) / 1000
-            ulog("forward_upload: body sent, " + str(sent) + " of " + str(size) +
-                 " bytes in " + str(elapsed) + "s")
-            try:
-                resp = s.recv(200)
-                ulog("forward_upload: response=" + str(resp))
-            except Exception as e:
-                ulog("forward_upload: no response read: " + str(e))
+            while True:
+                if _remaining_seconds(start, max_seconds) <= 0:
+                    raise RuntimeError("transfer exceeded " + str(max_seconds) + "s, aborting")
+                chunk = f.read(2048)
+                if not chunk:
+                    break
+                _send_all_bounded(s, chunk, start, max_seconds)
+                sent += len(chunk)
         finally:
-            s.close()
+            f.close()
+        elapsed = time.ticks_diff(time.ticks_ms(), start) / 1000
+        ulog("forward_upload: body sent, " + str(sent) + " of " + str(size) +
+             " bytes in " + str(elapsed) + "s")
+        resp = _recv_bounded(s, 200, start, max_seconds)
+        ulog("forward_upload: response=" + str(resp))
+        s.close()
         ulog("forward_upload: done, closed socket")
         return True
     except Exception as e:
         ulog("forward_upload: EXCEPTION " + type(e).__name__ + " " + str(e))
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
         return False
 
 
@@ -874,44 +993,148 @@ def parse_gprmc(line):
     return (lat, lon, utc, speed_kn, course_deg)
 
 
+def parse_gpgga(line):
+    # $GPGGA,time,lat,N/S,lon,E/W,fix_quality,num_sats,hdop,altitude,M,...
+    # carries altitude and satellite count, which GPRMC doesn't -- used
+    # to enrich a GPRMC fix, not as the primary fix trigger, since not
+    # every module sends GGA and its lat/lon would just duplicate RMC's
+    if not line.startswith("$GPGGA") and not line.startswith("$GNGGA"):
+        return None
+    parts = line.split(",")
+    if len(parts) < 10:
+        return None
+    try:
+        fix_quality = int(parts[6]) if parts[6] else 0
+    except Exception:
+        fix_quality = 0
+    if fix_quality == 0:
+        return None  # 0 = no fix
+    num_sats = None
+    try:
+        if parts[7]:
+            num_sats = int(parts[7])
+    except Exception:
+        num_sats = None
+    altitude_m = None
+    try:
+        if parts[9]:
+            altitude_m = float(parts[9])
+    except Exception:
+        altitude_m = None
+    return (fix_quality, num_sats, altitude_m)
+
+
+class GPSReader:
+    # incremental GPS reader driven one poll_once() call at a time,
+    # instead of blocking in its own sleep loop until done/timed out --
+    # lets a caller like GPSPage interleave polling with GUI updates
+    # (ticker, button response) during a slow cold-start fix instead
+    # of freezing the whole screen for the length of the timeout.
+    # Also tracks bytes_seen/sentences_seen so callers can tell "module
+    # isn't sending anything at all" (wiring/power problem) apart from
+    # "module is responding but hasn't got a satellite lock yet".
+    def __init__(self):
+        self.uart = None
+        self.err = None
+        try:
+            import machine
+            self.uart = machine.UART(GPS_UART_ID, baudrate=GPS_BAUD,
+                                       tx=machine.Pin(GPS_TX_PIN), rx=machine.Pin(GPS_RX_PIN))
+        except Exception as e:
+            self.err = "GPS UART error: " + str(e)
+        self.buf = b""
+        self.bytes_seen = 0
+        self.sentences_seen = 0
+        self.rmc_result = None
+        self.gga_extra = (None, None, None)  # fix_quality, num_sats, altitude_m
+
+    def poll_once(self):
+        # reads whatever's available right now and returns immediately
+        # -- never sleeps/blocks, safe to call every page_tick
+        if self.uart is None or self.err:
+            return
+        try:
+            n = self.uart.any()
+        except Exception as e:
+            self.err = "GPS read error: " + str(e)
+            return
+        if not n:
+            return
+        try:
+            chunk = self.uart.read(n)
+        except Exception as e:
+            self.err = "GPS read error: " + str(e)
+            return
+        if not chunk:
+            return
+        self.bytes_seen += len(chunk)
+        self.buf += chunk
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            try:
+                text = line.decode().strip()
+            except Exception:
+                continue
+            if not text:
+                continue
+            self.sentences_seen += 1
+            gga = parse_gpgga(text)
+            if gga:
+                self.gga_extra = gga
+            if self.rmc_result is None:
+                self.rmc_result = parse_gprmc(text)
+
+    def has_fix(self):
+        return self.rmc_result is not None
+
+    def result(self):
+        # (lat, lon, utc, speed_kn, course_deg, altitude_m, num_sats, fix_quality)
+        lat, lon, utc, speed_kn, course_deg = self.rmc_result
+        fix_quality, num_sats, altitude_m = self.gga_extra
+        return (lat, lon, utc, speed_kn, course_deg, altitude_m, num_sats, fix_quality)
+
+    def no_fix_message(self):
+        # distinguishes a dead link (nothing received at all -- wiring/
+        # power problem) from a live link still searching for satellites
+        if self.bytes_seen == 0:
+            return "No data from GPS module -- check wiring/power (TX/RX crossed? GND connected? module powered?)"
+        return "No GPS fix yet (module responding, %d sentence(s) seen) -- still searching for satellites, check sky view" % self.sentences_seen
+
+
 def read_gps_fix_full(timeout_ms=4000):
     # returns ((lat, lon, utc_or_None, speed_knots_or_None,
-    # course_deg_or_None), None) on success, or (None, error_message)
-    # on failure -- wrapped in broad try/except since we can't confirm
-    # the module/wiring is actually present on any given board.
-    # utc_or_None is (year, month, day, hour, min, sec) straight from
-    # the GPS's own UTC clock, when the sentence included it -- this
-    # is what STAR uses for "current time" since it's far more
-    # trustworthy than an onboard RTC that may not be battery-backed
-    # or synced. speed/course come from the same GPRMC sentence.
-    try:
-        import machine
-        uart = machine.UART(GPS_UART_ID, baudrate=GPS_BAUD,
-                              tx=machine.Pin(GPS_TX_PIN), rx=machine.Pin(GPS_RX_PIN))
-    except Exception as e:
-        return None, "GPS UART error: " + str(e)
+    # course_deg_or_None, altitude_m_or_None, num_sats_or_None,
+    # fix_quality_or_None), None) on success, or (None, error_message)
+    # on failure. utc_or_None is (year, month, day, hour, min, sec)
+    # straight from the GPS's own UTC clock, when the sentence included
+    # it -- this is what STAR uses for "current time" since it's far
+    # more trustworthy than an onboard RTC that may not be battery-
+    # backed or synced. speed/course come from the same GPRMC sentence.
+    # altitude/num_sats/fix_quality come from GPGGA, read opportunistically
+    # in the same window: once an RMC fix is in hand, this waits up to
+    # 3 more seconds for a GGA to enrich it before giving up on that
+    # part and returning the RMC-only fix, rather than blocking for the
+    # entire timeout on a sentence type some modules never send.
+    reader = GPSReader()
+    if reader.err:
+        return None, reader.err
     start = time.ticks_ms()
-    buf = b""
-    try:
-        while time.ticks_diff(time.ticks_ms(), start) < timeout_ms:
-            n = uart.any()
-            if n:
-                chunk = uart.read(n)
-                if chunk:
-                    buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
-                    try:
-                        text = line.decode().strip()
-                    except Exception:
-                        continue
-                    parsed = parse_gprmc(text)
-                    if parsed:
-                        return parsed, None
-            time.sleep_ms(50)
-    except Exception as e:
-        return None, "GPS read error: " + str(e)
-    return None, "No GPS fix (timed out -- check antenna/sky view/wiring)"
+    fix_found_at = None
+    while time.ticks_diff(time.ticks_ms(), start) < timeout_ms:
+        reader.poll_once()
+        if reader.err:
+            return None, reader.err
+        if reader.has_fix():
+            if reader.gga_extra[0] is not None:
+                return reader.result(), None
+            if fix_found_at is None:
+                fix_found_at = time.ticks_ms()
+            elif time.ticks_diff(time.ticks_ms(), fix_found_at) >= 3000:
+                return reader.result(), None
+        time.sleep_ms(50)
+    if reader.has_fix():
+        return reader.result(), None
+    return None, reader.no_fix_message()
 
 
 def read_gps_fix(timeout_ms=4000):
@@ -920,8 +1143,107 @@ def read_gps_fix(timeout_ms=4000):
     result, err = read_gps_fix_full(timeout_ms)
     if result is None:
         return None, err
-    lat, lon, _utc, _speed, _course = result
+    lat, lon = result[0], result[1]
     return (lat, lon), None
+
+
+# --- WEATHER (current conditions, by GPS coordinates) ----------------
+# Open-Meteo (open-meteo.com) -- free, no API key/signup needed, which
+# matters here since a key would otherwise have to live in this file/
+# on the SD card. HTTPS only, so this reuses the same raw
+# socket+ssl.wrap_socket approach as the SMTP email sender (no
+# urequests library on this build) rather than a proper HTTP client.
+
+WEATHER_HOST = "api.open-meteo.com"
+
+# WMO weather codes, as used by Open-Meteo's "weathercode" field --
+# only the common ones are named individually; anything else falls
+# back to "Code N" rather than guessing at a description
+WEATHER_CODES = {
+    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Fog", 48: "Depositing rime fog",
+    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+    61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+    71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
+    77: "Snow grains",
+    80: "Slight rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    85: "Slight snow showers", 86: "Heavy snow showers",
+    95: "Thunderstorm", 96: "Thunderstorm with slight hail", 99: "Thunderstorm with heavy hail",
+}
+
+
+def weather_code_text(code):
+    if code in WEATHER_CODES:
+        return WEATHER_CODES[code]
+    return "Code %d" % code
+
+
+def _dechunk_http_body(data):
+    # minimal HTTP/1.1 chunked-transfer-encoding decoder -- Open-Meteo's
+    # response is small enough it usually arrives with a plain
+    # Content-Length instead, but this covers the case where it doesn't
+    out = b""
+    while data:
+        idx = data.find(b"\r\n")
+        if idx < 0:
+            break
+        try:
+            size = int(data[:idx].split(b";")[0], 16)
+        except ValueError:
+            break
+        if size == 0:
+            break
+        out += data[idx + 2:idx + 2 + size]
+        data = data[idx + 2 + size + 2:]
+    return out
+
+
+def _http_get_json(host, path, timeout=10):
+    # raw HTTPS GET, same connect-then-wrap-in-TLS approach _smtp_connect_and_auth
+    # uses for email -- there's no urequests-style HTTP client available here
+    addr = socket.getaddrinfo(host, 443)[0][-1]
+    raw_sock = socket.socket()
+    raw_sock.settimeout(timeout)
+    raw_sock.connect(addr)
+    sock = ssl.wrap_socket(raw_sock, server_hostname=host)
+    try:
+        request = ("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n"
+                   "User-Agent: club.py\r\n\r\n" % (path, host))
+        sock.write(request.encode())
+        response = b""
+        while True:
+            chunk = sock.read(512)
+            if not chunk:
+                break
+            response += chunk
+    finally:
+        sock.close()
+    header_end = response.find(b"\r\n\r\n")
+    if header_end < 0:
+        raise RuntimeError("malformed HTTP response")
+    headers = response[:header_end].decode()
+    body = response[header_end + 4:]
+    status_line = headers.split("\r\n")[0]
+    if " 200 " not in status_line:
+        raise RuntimeError("HTTP error: " + status_line)
+    if "chunked" in headers.lower():
+        body = _dechunk_http_body(body)
+    return json.loads(body)
+
+
+def fetch_weather(lat, lon):
+    # returns (current_weather_dict, None) on success, or (None, error_message)
+    # on failure -- needs WiFi connected, wrapped broadly since that's
+    # not guaranteed on any given board/location
+    path = "/v1/forecast?latitude=%.4f&longitude=%.4f&current_weather=true" % (lat, lon)
+    try:
+        data = _http_get_json(WEATHER_HOST, path)
+    except Exception as e:
+        return None, "Weather fetch failed: " + type(e).__name__ + " " + str(e)
+    cw = data.get("current_weather")
+    if not cw:
+        return None, "Weather: no current conditions in response"
+    return cw, None
 
 
 # --- GPS AND ASTRONOMICAL COMMANDS: STAR, LOCATION, ASTRO, SLEW -----
@@ -1379,6 +1701,12 @@ last_gps_check = 0
 last_received_file = ""
 last_received_time = ""
 
+# most recent successful GET WEATHER result -- (description, temp_c,
+# wind_kmh), or None if no fetch has succeeded yet this session. Shown
+# in every page's ticker (see Page._live_ticker_info) only once set,
+# same "if it's enabled" pattern as last_gps_fix/last_received_file
+last_weather = None
+
 
 def check_in(num):
     key = setting("active")
@@ -1425,6 +1753,12 @@ FINANCIAL = ["Yes", "No"]
 
 
 class Page:
+    # override in a subclass to control what shows in the footer
+    # ticker's page-name segment (see _page_label) -- falls back to
+    # the class name (minus a trailing "Page") if left unset, so most
+    # pages don't need to set this explicitly
+    PAGE_LABEL = None
+
     def __init__(self):
         self.next = None
 
@@ -1488,6 +1822,35 @@ class Page:
         g.button(602, 4, 32, 26, "?", fg=WHITE, bg=BTN, font=2,
                  callback=lambda b: self.go("help|" + topic + "|" + return_to))
 
+    def _page_label(self):
+        if self.PAGE_LABEL:
+            return self.PAGE_LABEL
+        name = type(self).__name__
+        if name.endswith("Page"):
+            name = name[:-4]
+        return name.upper()
+
+    def _live_ticker_info(self):
+        # GPS fix / last-received-file / last weather fetch status --
+        # shown in every page's footer ticker, not just the main
+        # Menu's, so it's visible no matter where you are in the app.
+        # Each one only shows once it's actually been set ("if it's
+        # enabled") -- e.g. weather never appears until GET WEATHER
+        # has succeeded at least once this session.
+        global last_gps_fix, last_received_file, last_received_time, last_weather
+        parts = []
+        if last_gps_fix:
+            parts.append("GPS: %.5f, %.5f" % last_gps_fix)
+        if last_weather:
+            desc, temp, wind = last_weather
+            if temp is not None:
+                parts.append("Weather: %s, %.1f C" % (desc, temp))
+            else:
+                parts.append("Weather: " + desc)
+        if last_received_file:
+            parts.append("Received: " + last_received_file + " at " + last_received_time)
+        return "   |   ".join(parts)
+
     def ticker_update(self):
         if not hasattr(self, "ticker_last"):
             return
@@ -1495,7 +1858,13 @@ class Page:
         if time.ticks_diff(now, self.ticker_last) < 200:
             return
         self.ticker_last = now
-        full = display_stamp() + "     |     " + self.ticker_base + "          "
+        segments = [display_stamp(), self._page_label()]
+        live = self._live_ticker_info()
+        if live:
+            segments.append(live)
+        if self.ticker_base:
+            segments.append(self.ticker_base)
+        full = "     |     ".join(segments) + "          "
         L = len(full)
         if L == 0:
             self.msg.value = ""
@@ -1514,7 +1883,39 @@ ICON_NAMES = {
     "NEW FILE": "new_file", "OPEN": "open", "SAVE AS": "save_as", "DELETE": "delete",
     "SELECT": "select", "LINE": "line", "CTR LINE": "centerline", "BOX": "box",
     "CIRCLE": "circle", "ARC": "arc", "MULTI LINE": "multi_line", "RADIUS": "radius", "GRID": "grid",
+    "CALCULATOR": "calculator", "MEASURE": "measure", "COLOUR": "colour",
 }
+
+NAV_ICON_SIZE = 22
+
+
+def draw_nav_button(g, x, y, w, h, icon_name, enabled, callback):
+    # blank-label button for the tap target/background, chevron icon
+    # drawn on top afterwards -- same trick CalculatorPage/Model3DPage
+    # use for their own icons. Used for the PREV/NEXT-style controls
+    # (Help pages, Club Cars gallery paging) -- these always occupy their
+    # spot on screen, just switched between the normal and "_dim" icon
+    # variant with a no-op callback when that direction isn't usable,
+    # rather than disappearing entirely.
+    if enabled:
+        g.button(x, y, w, h, "", fg=WHITE, bg=BTN, font=2, callback=callback)
+        bmp_name = icon_name + ".bmp"
+    else:
+        g.button(x, y, w, h, "", fg=DIM_FG, bg=DIM_BG, font=2, callback=lambda b: None)
+        bmp_name = icon_name + "_dim.bmp"
+    ix = x + (w - NAV_ICON_SIZE) // 2
+    iy = y + (h - NAV_ICON_SIZE) // 2
+    try:
+        pcimage.draw_bmp(ICONS_DIR + "/" + bmp_name, ix, iy, dither=True)
+    except Exception as e:
+        ulog("draw_nav_button: icon load failed for " + bmp_name + ": " + type(e).__name__ + " " + str(e))
+
+# a page-break marker: _paginate() starts a fresh page here regardless of
+# how much room is left on the current one, rather than only breaking
+# once content overflows -- lets a topic's layout be curated by hand
+# (e.g. HELP_TEXT["menu"] below) instead of always relying on the
+# automatic overflow point
+PAGE_BREAK = ("__PAGE_BREAK__", None)
 
 # topic -> (page title, [(button/field label, what it does), ...])
 HELP_TEXT = {
@@ -1524,8 +1925,13 @@ HELP_TEXT = {
         ("WIFI", "Connect to a network, name this board, manage saved networks and board-to-board forwarding."),
         ("PHOTOS", "Browse, upload, rename, or delete general photos."),
         ("IMPORT SD", "Copy pictures in from the SD card."),
-        ("3D MODEL EDITOR", "Build a 3D model (boxes, lines, circles, arcs) and view it as a wireframe."),
-        ("CALCULATOR", "A basic four-function calculator."),
+        PAGE_BREAK,
+        ("3D MODEL EDITOR", "Build 3D wireframe models from boxes, lines, circles, arcs, and multi-point "
+         "paths with radius corner rounding. Rotate, zoom, snap to grid, use layers and undo/redo, then "
+         "export to STL or send the file to another board."),
+        ("CALCULATOR", "A basic four-function calculator, plus a full scientific mode: sin/cos/tan and "
+         "their inverses, log/ln, powers, square roots, 1/x, pi and e, with a DEG/RAD toggle."),
+        PAGE_BREAK,
         ("GAMES", "Browse and run .py games from /sd/Games."),
         ("EXPORT / IMPORT", "Write CSV files, send them to other boards, email them, or import a CSV back in."),
         ("EMAIL", "Shortcut straight to Export/Import, where EMAIL LAST sends the most recent export."),
@@ -1594,12 +2000,17 @@ HELP_TEXT = {
         ("REFRESH", "Rescans the folder for new files."),
         ("USE PHOTO", "Attaches the picked photo to whatever you came here from."),
         ("CLEAR PHOTO", "Removes the current attachment (doesn't delete the file)."),
-        ("SHOW PIC", "Displays the picked photo full-screen."),
+        ("SHOW PIC", "Displays the picked photo in a bordered preview window -- press CLOSE to return."),
         ("DELETE", "Deletes the picked photo file -- press twice to confirm."),
         ("UPLOAD STATUS", "Shows the URL to browse to for uploading photos from a phone."),
         ("SEND TO BOARD", "Sends the picked photo to every board saved on the Wifi page."),
         ("RENAME", "Renames the picked photo."),
         ("BACK", "Return to where you came from."),
+    ]),
+    "clubcars": ("Club Cars", [
+        ("Grid", "One tile per numbered photo (1.jpg, 2.jpg, ...) found in the photo folder -- tap a tile to view it."),
+        ("Preview", "Opens the matching full-size photo (e.g. 1a.jpg) in a bordered window; falls back to the thumbnail if no full-size photo exists."),
+        ("MENU", "Return to the main menu."),
     ]),
     "sdimport": ("Import from SD", [
         ("List", "Every file and folder at this location on the SD card -- tap a folder to open it, tap a file to pick it."),
@@ -1619,15 +2030,30 @@ HELP_TEXT = {
         ("SAVE AS", "Type a name and save everything currently modelled to the SD card."),
         ("DELETE", "If something is SELECTED (highlighted red), removes just that item (undoable). Otherwise, pick a saved model from the list and remove that file."),
         ("SELECT", "Click near an item's outline in the VIEW panel to select it (highlighted red) -- press DELETE to remove it, or pick another command to cancel."),
-        ("LAYER button", "Shows the active layer -- new items go on it. Opens LAYERS: pick one then SET ACTIVE, TOGGLE SHOW (hide/unhide), or NEW LAYER."),
+        ("LAYER button", "Shows the active layer -- new items go on it. Opens LAYERS: pick one then SET ACTIVE, TOGGLE SHOW (hide/unhide), or NEW LAYER. "
+         "Also has SET ORIGIN (type an X/Y/Z point that typed 0,0,0 should mean from then on -- BOX/LINE corners and ARC centres only, not click-to-place) "
+         "and RESTORE ORIGIN (resets back to the model's true 0,0,0 -- nothing already built moves)."),
         ("LINE", "Choose CLICK ON GRID (tap start then end point in the VIEW panel, snaps to the grid if one's set) or TYPE VALUES (enter X/Y/Z numbers)."),
         ("CTR LINE", "Pick an axis (tap to cycle X/Y/Z) and a length -- adds a line through the origin along that axis. Snaps the length to the nearest GRID spacing if a grid is set."),
         ("BOX", "Choose CLICK ON GRID (tap one corner then the opposite corner in the VIEW panel) or TYPE VALUES (enter X/Y/Z numbers)."),
         ("CIRCLE", "Enter a centre point and radius; tap the plane button to cycle XY/XZ/YZ. Adds a selectable centre-mark crosshair through the middle too."),
         ("ARC", "Same as CIRCLE plus a start/end angle in degrees, swept counter-clockwise."),
-        ("MULTI LINE", "Type how many points (3+), then click each one in the VIEW panel in order -- the last point connects back to the first, forming a closed shape (e.g. a star). SELECT + EXTRUDE turns it into a solid, not just an outline."),
-        ("RADIUS", "Click two BOX walls that meet at a right angle (e.g. two adjacent enclosure walls), then give a radius in mm -- rounds that outer corner, trimming both walls and filling the gap with a solid quarter-round. Click the SAME wall twice instead to round one of its own corners (e.g. a flat base plate)."),
-        ("GRID", "Set a spacing, extent, plane (tap to cycle XY/XZ/YZ), and position along that plane's normal axis (e.g. Y for an XZ 'vertical' grid, to line it up with a wall). Replaces any existing grid. Once set, every typed X/Y/Z/radius/angle value in every dialog rounds to this spacing."),
+        ("MULTI LINE", "Type how many points (3+), then choose CLICK ON GRID (click each one in VIEW in order) "
+         "or TYPE VALUES (type X/Y/Z for each point in turn, same as BOX/LINE) -- the last point connects "
+         "back to the first, forming a closed shape. All points need to share one plane (typed entry works out "
+         "which axis that is automatically); SELECT + EXTRUDE turns it into a solid."),
+        ("RADIUS", "Click two BOX walls meeting at a right angle, then give a radius in mm -- rounds that "
+         "corner, trimming both walls. Click the SAME wall twice to round one of its own corners."),
+        ("GRID", "The list at the top shows all three planes (XY/XZ/YZ) at once, e.g. 'XY  10mm  110x100  pos 0  ON' "
+         "or 'XZ  (no grid)' -- tap a row to select that plane; fields below (Spacing/Extent/Position) fill in from "
+         "its existing grid, or stay blank if it doesn't have one yet. Up to one grid per plane can be active at "
+         "once -- CREATE makes/replaces the SELECTED plane's grid. TOGGLE VISIBLE hides/shows just that one grid "
+         "without deleting it. DELETE THIS GRID removes it entirely. Both are separate from the GRID button below "
+         "the mouse readout, which hides all grids at once without deleting any of them."),
+        ("MEASURE", "Click two points in the VIEW panel -- shows the straight-line distance between them "
+         "in mm. Doesn't add anything to the model, just reports the number."),
+        ("COLOUR", "SELECT something first -- shows a small coloured square marker on it (3 R/G/B toggles, "
+         "8 colours). Marks it, doesn't recolour the wireframe itself."),
         ("VIEW panel", "Rotatable view of everything modelled -- X is red, Y is green, Z is blue, all from the origin marked 0,0."),
         ("+ / - / RST", "Zoom in, zoom out, or reset the view back to its default position, zoom, and rotation."),
         ("U / D / L / R", "Pan the view up/down/left/right in fixed steps."),
@@ -1637,7 +2063,8 @@ HELP_TEXT = {
         ("GRID button", "Below the mouse position readout -- shows or hides the GRID dots on their own, independent of WIRE."),
         ("SNAP", "Master on/off for grid snapping -- when off, every typed value and click position is used exactly as entered even if a GRID is set."),
         ("EXTRUDE", "SELECT anything first, then give a height in mm: LINE becomes a wall, BOX grows taller, CIRCLE becomes a cylinder, ARC becomes a curved wall, MULTI LINE becomes a solid extruded shape."),
-        ("EDIT", "SELECT anything first -- opens its points/radius/angles pre-filled so you can fix a mistake without deleting and redrawing it. Also has its own DELETE THIS ITEM button."),
+        ("EDIT", "SELECT anything first -- opens its points/radius/angles pre-filled so you can fix a mistake "
+         "without deleting and redrawing it. For MULTI LINE, re-click each point in order to reposition them instead."),
         ("UNDO / REDO", "Step back or forward through NEW FILE/OPEN/LINE/BOX/CIRCLE/ARC/GRID/EXTRUDE/EDIT changes."),
         ("MENU", "Return to the main menu."),
     ]),
@@ -1646,6 +2073,17 @@ HELP_TEXT = {
         ("=", "Evaluates the expression typed so far."),
         ("<-", "Backspace -- removes the last character typed."),
         ("C", "Clears the expression completely."),
+        ("MENU", "Return to the main menu."),
+    ]),
+    "gps": ("GPS", [
+        ("GET FIX", "Takes a fresh reading from the GPS module (up to a few seconds -- needs a clear view of the sky). Shows position, altitude, speed, course, satellite count, and the GPS's own UTC time. This page also refreshes itself automatically every 15 seconds while it's open, so you don't need to keep pressing it."),
+        ("Lat / Lon", "Current position in decimal degrees."),
+        ("Altitude", "Height above sea level in metres -- only shown if the module sends a GGA sentence with a valid fix."),
+        ("Speed / Course", "Ground speed and direction of travel -- only shown while moving; '--' means the GPS module didn't report them."),
+        ("Satellites", "Number of satellites used in the fix, plus fix quality -- more satellites generally means a more accurate fix."),
+        ("GPS time (UTC)", "The GPS module's own clock, straight from the satellite signal -- more trustworthy than the board's onboard clock."),
+        ("GET WEATHER", "Fetches current conditions (temperature, description, wind) for the last GPS fix, over WiFi -- needs a fix already taken, and needs the board connected to WiFi. Takes a few seconds; free service (Open-Meteo), no account/key needed. Also auto-refreshes roughly every 2.5 minutes while this page is open."),
+        ("Menu ticker", "Every page's scrolling footer shows the most recent fix and weather automatically, refreshed in the background."),
         ("MENU", "Return to the main menu."),
     ]),
     "export": ("Export / Import", [
@@ -1699,15 +2137,17 @@ class HelpPage(Page):
                 cur = word
         if cur:
             lines.append(cur)
-        if len(lines) > 2:
-            lines = lines[:2]
-            lines[1] = lines[1][:width - 3] + "..."
+        if len(lines) > 3:
+            lines = lines[:3]
+            lines[2] = lines[2][:width - 3] + "..."
         return lines
 
+    LINE_H = 17  # was 14 -- lines read as too cramped at that spacing
+
     def _row_height(self, label, desc):
-        text_h = 18 + 14 * len(self.wrap(desc, self._desc_width(label)))
+        text_h = 18 + self.LINE_H * len(self.wrap(desc, self._desc_width(label)))
         icon_h = self.ICON_SIZE if label in ICON_NAMES else 0
-        return max(text_h, icon_h) + 8
+        return max(text_h, icon_h) + 12
 
     def _desc_width(self, label):
         # narrower wrap for rows with an icon -- their text starts
@@ -1715,25 +2155,54 @@ class HelpPage(Page):
         return 66 if label in ICON_NAMES else 76
 
     def _paginate(self, entries):
+        # extra vertical breathing room between rows on a page that ends
+        # up with only a few entries on it (either because the topic is
+        # short, or because a forced PAGE_BREAK left some room spare) --
+        # spreads what's there out to fill the space instead of leaving
+        # it bunched at the top with blank space below
         pages = []
         current = []
         y = self.ROW_TOP
         for entry in entries:
+            if entry == PAGE_BREAK:
+                if current:
+                    pages.append(current)
+                current = []
+                y = self.ROW_TOP
+                continue
             h = self._row_height(entry[0], entry[1])
-            if current and y + h > self.ROW_BOTTOM:
+            # small safety margin -- the wrap-width-based row height is an
+            # estimate, not a pixel-exact font measurement, so a page that
+            # comes out within a few px of ROW_BOTTOM is one rendering
+            # quirk away from actually overflowing on real hardware
+            if current and y + h > self.ROW_BOTTOM - 15:
                 pages.append(current)
                 current = []
                 y = self.ROW_TOP
             current.append(entry)
             y += h
-        pages.append(current)
+        if current:
+            pages.append(current)
+        if not pages:
+            pages = [[]]
         return pages
+
+    def _spaced_pages(self, entries):
+        pages = self._paginate(entries)
+        result = []
+        for page_entries in pages:
+            used = sum(self._row_height(l, d) for l, d in page_entries)
+            slack = max(0, (self.ROW_BOTTOM - self.ROW_TOP) - used)
+            extra_gap = slack // len(page_entries) if page_entries else 0
+            result.append((page_entries, extra_gap))
+        return result
 
     def _redraw(self):
         try:
             self.g.stop()
         except Exception:
             pass
+        hdmi.fill(hdmi.fb().colour(PAGE))
         g = pcgui.GUI()
         self.g = g
         g.start()
@@ -1741,9 +2210,10 @@ class HelpPage(Page):
 
     def build(self, g):
         title, entries = HELP_TEXT.get(self.topic, ("Help", []))
-        pages = self._paginate(entries)
+        spaced_pages = self._spaced_pages(entries)
+        pages = [p[0] for p in spaced_pages]
         self.page = max(0, min(self.page, len(pages) - 1))
-        page_entries = pages[self.page]
+        page_entries, extra_gap = spaced_pages[self.page]
 
         header = "Help -- " + title
         if len(pages) > 1:
@@ -1766,17 +2236,18 @@ class HelpPage(Page):
             ty = y + 18
             for line in self.wrap(desc, self._desc_width(label)):
                 g.caption(text_x + 10, ty, line, fg=INK, bg=PAGE, font=1)
-                ty += 14
-            y += self._row_height(label, desc)
+                ty += self.LINE_H
+            y += self._row_height(label, desc) + extra_gap
 
         if len(pages) > 1:
             # sits between the content and the scrolling footer ticker
             # footer() adds below, not the same lower spot the
-            # standalone editor's HelpPage uses (it has no footer)
-            if self.page > 0:
-                g.button(20, 412, 90, 28, "PREV", fg=WHITE, bg=BTN, font=2, callback=self.on_prev_page)
-            if self.page < len(pages) - 1:
-                g.button(530, 412, 90, 28, "NEXT", fg=WHITE, bg=BTN, font=2, callback=self.on_next_page)
+            # standalone editor's HelpPage uses (it has no footer) --
+            # both buttons always show, dimmed with a no-op callback when
+            # that direction isn't available, rather than disappearing
+            # (an empty gap looked like the page was still loading)
+            draw_nav_button(g, 20, 412, 90, 28, "arrow_back", self.page > 0, self.on_prev_page)
+            draw_nav_button(g, 530, 412, 90, 28, "arrow_forward", self.page < len(pages) - 1, self.on_next_page)
 
         self.footer(g)
 
@@ -1827,7 +2298,9 @@ class Menu(Page):
 
         g.button(20, 386, 296, 30, "3D MODEL EDITOR", fg=WHITE, bg=BTN, font=1, callback=self.on_model3d)
         g.button(324, 386, 296, 30, "CALCULATOR", fg=WHITE, bg=BTN, font=1, callback=self.on_calculator)
-        g.button(172, 420, 296, 26, "GAMES", fg=WHITE, bg=BTN, font=1, callback=self.on_games)
+        g.button(20, 420, 192, 26, "GAMES", fg=WHITE, bg=BTN, font=1, callback=self.on_games)
+        g.button(224, 420, 192, 26, "CLUB CARS", fg=WHITE, bg=BTN, font=1, callback=self.on_clubcars)
+        g.button(428, 420, 192, 26, "GPS", fg=WHITE, bg=BTN, font=1, callback=self.on_gps)
 
         self.footer(g)
         self.help_button(g, "menu", "menu")
@@ -1853,33 +2326,14 @@ class Menu(Page):
             self.net.value = "Wifi: " + sta.ifconfig()[0] + ":8080   " + str(n) + " picture(s) in " + PHOTO_DIR
         else:
             self.net.value = "Wifi: not connected   " + str(n) + " picture(s) in " + PHOTO_DIR
-        self.update_ticker_text()
-        self.last_gps_attempt = 0
-        self._seen_received_file = last_received_file
-        self._seen_gps_fix = last_gps_fix
-
-    def update_ticker_text(self):
-        global last_gps_fix, last_received_file, last_received_time
-        text = "Welcome to Tailem-Bend Car Club"
-        if last_gps_fix:
-            text += "   |   GPS: %.5f, %.5f" % last_gps_fix
-        else:
-            text += "   |   GPS: (no fix yet)"
-        if last_received_file:
-            text += "   |   Received: " + last_received_file + " at " + last_received_time
-        self.say(text)
+        # GPS fix / received-file status is now composed automatically
+        # by the base Page ticker_update() on every page (see
+        # Page._live_ticker_info), refreshed straight from the globals
+        # every ~200ms -- no need to track/diff them here any more
+        self.say("Welcome to Tailem-Bend Car Club")
 
     def page_tick(self):
-        global last_gps_fix, last_gps_check, last_received_file
-        # cheap checks every tick -- no I/O, just variable compares --
-        # so a file arriving, or a phone GPS fix landing, shows up
-        # immediately rather than waiting on the next 20s cycle
-        if last_received_file != self._seen_received_file:
-            self._seen_received_file = last_received_file
-            self.update_ticker_text()
-        if last_gps_fix != self._seen_gps_fix:
-            self._seen_gps_fix = last_gps_fix
-            self.update_ticker_text()
+        global last_gps_fix, last_gps_check
         now = time.ticks_ms()
         # only attempt a GPS read every 20s, and only a quick one --
         # a full-length read would freeze the whole menu each time
@@ -1889,7 +2343,6 @@ class Menu(Page):
         fix, err = read_gps_fix(timeout_ms=300)
         if fix:
             last_gps_fix = fix
-            self.update_ticker_text()
 
     def on_members(self, b):
         self.go("members")
@@ -1914,6 +2367,12 @@ class Menu(Page):
 
     def on_games(self, b):
         self.go("games")
+
+    def on_clubcars(self, b):
+        self.go("clubcars")
+
+    def on_gps(self, b):
+        self.go("gps")
 
     def on_export(self, b):
         self.go("export")
@@ -2262,100 +2721,145 @@ def url_unquote(s):
     return "".join(out)
 
 
-def render_picture_fullscreen(path, filename):
-    # switches to RGB1024 for the duration of the preview -- RGB640
-    # turned out to be a low color-depth mode (fine for the app's flat
-    # UI colors, not enough for real photos), so we need the higher
-    # mode for decent quality. To give the switch the best chance of
-    # being stable: free memory with gc.collect() before touching the
-    # display, and give the monitor extra time to re-lock before we
-    # draw or switch back.
-    # Caller is responsible for stopping its own GUI before calling
-    # this and rebuilding its widgets afterward -- this function never
-    # touches any GUI object, just the raw display. Returns an error
-    # message string on failure, or None on success.
+# Old picture preview used to switch the display to hdmi.RGB1024 and pick
+# the sharpest jpeg decode scale that fit that 1024px-wide screen. For a
+# full-resolution phone photo (e.g. 1536x2048) that meant decoding at
+# barely any downscale at all, which needs more scratch RAM than this
+# board has -- not a catchable Python exception, an actual MCU hard fault
+# that reset the board. The replacement below never leaves RGB640 and
+# always picks a decode scale bounded by MAX_DECODE_DIM instead of by
+# what fits the screen, so decoder memory use stays small no matter how
+# big the source file is.
+MAX_DECODE_DIM_THUMB = 100   # gallery grid tiles
+MAX_DECODE_DIM_SIMPLE = 400  # plain single-picture preview box (no extra
+                              # controls below it, so it can use most of
+                              # the screen's height)
+MAX_DECODE_DIM_RICH = 320    # Club Cars full-photo preview -- smaller than
+                              # SIMPLE because it also has to leave room
+                              # below the image for the rename/attach rows
+
+
+def safe_jpeg_scale(size, max_dim):
+    # largest-fitting scale from the set MicroPython's jpeg decoder
+    # supports, capped by max_dim rather than by screen size -- this is
+    # what keeps decode memory bounded regardless of the source photo's
+    # native resolution
+    if not size:
+        return 8
+    w, h = size
+    for s in (1, 2, 4, 8):
+        if w // s <= max_dim and h // s <= max_dim:
+            return s
+    return 8
+
+
+def draw_picture_safe(path, filename, x, y, max_dim, box_w=None, box_h=None):
+    # draws directly into whatever GUI/display mode is already active --
+    # never touches hdmi.deinit()/init(). Returns an error message string
+    # on failure (including a deliberate refusal for an oversized bitmap,
+    # since draw_bmp has no scale-down option), or None on success.
+    # If box_w/box_h are given, the decoded image is centred within that
+    # box (anchored at x,y as its top-left corner) instead of always
+    # sitting flush in the top-left corner -- smaller/thumbnail-scale
+    # decodes otherwise looked stuck in one corner of their preview area.
     low = filename.lower()
     is_bmp = low.endswith(".bmp")
-    error = None
-    gc.collect()
     try:
-        hdmi.deinit()
-        hdmi.init(hdmi.RGB1024)
-        time.sleep(4)  # let the monitor re-lock before drawing
-    except Exception as e:
-        ulog("render_picture: RGB1024 switch failed: " + str(e))
-        return "Could not switch display mode: " + str(e)
-    try:
-        hdmi.fill(0)
-        size = bmp_size(path) if is_bmp else jpeg_size(path)
-        CANVAS_W, CANVAS_H = 1024, 600
-        draw_y = 30
-        scale = 8
-        if size:
-            # pick the sharpest scale whose WIDTH fits -- height is
-            # allowed to run off the bottom of the screen (naturally
-            # clipped) rather than always falling back to the most
-            # aggressive scale just to guarantee the whole photo fits
-            for s in (2, 4, 8):
-                w = max(1, size[0] // (1 if is_bmp else s))
-                if w <= CANVAS_W:
-                    scale = s
-                    break
-            decoded_w = max(1, size[0] // (1 if is_bmp else scale))
-            decoded_h = max(1, size[1] // (1 if is_bmp else scale))
-        else:
-            decoded_w = decoded_h = 300
-        draw_x = max(0, (CANVAS_W - decoded_w) // 2)
-        if decoded_h > CANVAS_H - draw_y:
-            ulog("render_picture: " + filename + " decoded " + str(decoded_w) + "x" +
-                 str(decoded_h) + " -- taller than 1024x600 even at max scale")
-        try:
-            fb = hdmi.fb()
-            hdmi.text(filename, 10, 4, fb.colour(WHITE), -1, 1, 1)
-        except Exception as e:
-            ulog("render_picture: filename text failed: " + str(e))
         if is_bmp:
+            size = bmp_size(path)
+            if not size:
+                return "Could not read bitmap header"
+            if size[0] > max_dim or size[1] > max_dim:
+                return "Bitmap too large to preview safely (%dx%d)" % size
+            draw_x = x + max(0, (box_w - size[0]) // 2) if box_w else x
+            draw_y = y + max(0, (box_h - size[1]) // 2) if box_h else y
             pcimage.draw_bmp(path, draw_x, draw_y, dither=True)
         else:
+            size = jpeg_size(path)
+            if not size:
+                # can't confirm this is safe to decode at all -- refuse
+                # rather than hand an unparseable file to pcimage.draw_jpg
+                # and let its own (less clear) native error surface
+                return "Could not read this as a JPEG (bad or unsupported header)"
+            scale = safe_jpeg_scale(size, max_dim)
+            # 8 is the coarsest scale the jpeg decoder supports -- if the
+            # photo is still bigger than the box even at 1/8, there is no
+            # further downscale available, so draw_jpg would decode
+            # something taller/wider than the screen and run off the
+            # bottom/side rather than fit. Refuse cleanly instead of
+            # drawing that.
+            decoded_w, decoded_h = size[0] // scale, size[1] // scale
+            if decoded_w > max_dim or decoded_h > max_dim:
+                # caller splits this on "\n" into several short caption
+                # lines -- a single line this long ran off the edge of
+                # the screen instead of wrapping
+                return ("Photo is %dx%d -- too big to preview\n"
+                        "(%dx%d even at the coarsest scale)\n"
+                        "Resize before uploading, or use a smaller copy") % (
+                            size[0], size[1], decoded_w, decoded_h)
+            draw_x = x + max(0, (box_w - decoded_w) // 2) if box_w else x
+            draw_y = y + max(0, (box_h - decoded_h) // 2) if box_h else y
             pcimage.draw_jpg(path, draw_x, draw_y, scale, dither=True)
-        time.sleep(2)
     except Exception as e:
-        error = str(e)
-    finally:
-        try:
-            hdmi.deinit()
-            hdmi.init(hdmi.RGB640)
-            time.sleep(4)
-        except Exception as e:
-            ulog("render_picture: RGB640 switch-back failed: " + str(e))
-    return error
+        return type(e).__name__ + ": " + str(e)
+    return None
 
 
-def preview_picture(page, path, filename):
-    page.say("Rendering " + filename + " ... please wait")
-    try:
-        page.g.stop()
-    except Exception:
-        pass
-    err = render_picture_fullscreen(path, filename)
+def show_picture_boxed(path, filename):
+    # opens a bordered, titled box on the *current* RGB640 screen and
+    # blocks until the user presses CLOSE -- caller is responsible for
+    # stopping its own GUI before calling this and rebuilding its own
+    # widgets afterward (this function starts and fully stops its own
+    # GUI object and touches nothing else).
     hdmi.fill(hdmi.fb().colour(PAGE))
     g = pcgui.GUI()
-    page.g = g
     g.start()
-    page.build(g)
-    page.enter()
+    box_w, box_h = 460, 452
+    box_x, box_y = (640 - box_w) // 2, 10
+    g.frame(box_x, box_y, box_w, box_h, filename, fg=WHITE, font=2)
+    closed = [False]
+
+    def on_close(b):
+        closed[0] = True
+
+    # CLOSE lives in the frame's own top-right corner rather than below
+    # the box -- with the box now using most of the screen's height for
+    # a bigger preview, there's no room left underneath it
+    g.button(box_x + box_w - 90, box_y + 4, 80, 22, "CLOSE", fg=WHITE, bg=RED, font=1,
+             callback=on_close)
+    err = draw_picture_safe(path, filename, box_x + 12, box_y + 32, MAX_DECODE_DIM_SIMPLE,
+                             box_w=box_w - 24, box_h=MAX_DECODE_DIM_SIMPLE)
     if err:
-        page.say("Could not show picture: " + err)
+        ey = box_y + 40
+        g.caption(box_x + 12, ey, "Could not show picture:", fg=RED, bg=PAGE, font=1)
+        ey += 18
+        for line in err.split("\n"):
+            g.caption(box_x + 12, ey, line, fg=RED, bg=PAGE, font=1)
+            ey += 16
+    while not closed[0]:
+        g.poll()
+        time.sleep_ms(10)
+    try:
+        g.stop()
+    except Exception:
+        pass
 
 
 def receive_file_to(conn, already, length, filename, dest_dir, max_seconds=45):
+    # writes to a .tmp path and only replaces the real file once the
+    # full length has actually arrived -- writing straight to the real
+    # path used to mean ANY interrupted upload (dropped wifi, browser
+    # closed early, the board busy with something else at that moment)
+    # truncated it, silently destroying whatever good copy was already
+    # there. Returns True only if the complete file landed.
     try:
         os.mkdir(dest_dir)
     except OSError:
         pass
     path = dest_dir + "/" + filename
+    tmp_path = path + ".tmp"
     start = time.ticks_ms()
-    f = open(path, "wb")
+    f = open(tmp_path, "wb")
     try:
         written = 0
         if already:
@@ -2374,6 +2878,20 @@ def receive_file_to(conn, already, length, filename, dest_dir, max_seconds=45):
             written += len(chunk)
     finally:
         f.close()
+    if written == length:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        os.rename(tmp_path, path)
+        return True
+    ulog("receive_file_to: " + filename + " incomplete (" + str(written) + "/" + str(length) +
+         " bytes) -- discarding, previous file (if any) left untouched")
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
+    return False
 
 
 def send_upload_page_html(conn):
@@ -2410,6 +2928,16 @@ def send_upload_page_html(conn):
         "nameBox.value=n;"
         "}"
         "}"
+        "function resizeToBlob(bmp,maxDim,quality){"
+        "var scale=Math.min(1,maxDim/Math.max(bmp.width,bmp.height));"
+        "var w=Math.max(1,Math.round(bmp.width*scale));"
+        "var h=Math.max(1,Math.round(bmp.height*scale));"
+        "var canvas=document.createElement('canvas');"
+        "canvas.width=w;canvas.height=h;"
+        "var ctx=canvas.getContext('2d');"
+        "ctx.drawImage(bmp,0,0,w,h);"
+        "return new Promise(function(res){canvas.toBlob(res,'image/jpeg',quality);});"
+        "}"
         "async function go(){"
         "var file=document.getElementById('f').files[0];"
         "if(!file){document.getElementById('msg').innerText='Pick a file first';return;}"
@@ -2419,25 +2947,41 @@ def send_upload_page_html(conn):
         "if(!/\\.[a-zA-Z0-9]+$/.test(wanted)){wanted=wanted+'.jpg';}"
         "name=wanted;"
         "}"
+        "var dot=name.lastIndexOf('.');"
+        "var stem=dot>=0?name.slice(0,dot):name;"
+        "var ext=dot>=0?name.slice(dot):'.jpg';"
+        "var thumbName=stem+'_thumb'+ext;"
         "document.getElementById('msg').innerText='Preparing...';"
-        "var blob=file;"
+        # full-size upload is resized to fit a reasonable display box
+        # (the board can only ever decode a jpeg at 1, 1/2, 1/4 or 1/8
+        # scale, and has nowhere near enough RAM to load a full 12MP
+        # phone photo at all -- shrinking here on the phone, which has
+        # RAM and CPU to spare, is the only place this can happen) --
+        # and a small paired thumbnail is made the same way the old
+        # manual "N.jpg + Na.jpg" pairs worked, so the Club Cars gallery
+        # picks this upload up automatically
+        "var fullBlob=file;"
+        "var thumbBlob=null;"
         "try{"
         "if(window.createImageBitmap){"
         "var bmp=await createImageBitmap(file,{imageOrientation:'from-image'});"
-        "var canvas=document.createElement('canvas');"
-        "canvas.width=bmp.width;"
-        "canvas.height=bmp.height;"
-        "var ctx=canvas.getContext('2d');"
-        "ctx.drawImage(bmp,0,0);"
-        "var made=await new Promise(function(res){canvas.toBlob(res,'image/jpeg',0.9);});"
-        "if(made){blob=made;}"
+        "fullBlob=await resizeToBlob(bmp,1600,0.95);"
+        "thumbBlob=await resizeToBlob(bmp,160,0.9);"
         "}"
-        "}catch(e){blob=file;}"
-        "document.getElementById('msg').innerText='Uploading...';"
-        "fetch('/upload/'+encodeURIComponent(name),{method:'POST',body:blob})"
-        ".then(function(r){return r.text();})"
-        ".then(function(t){document.getElementById('msg').innerText=t;})"
-        ".catch(function(e){document.getElementById('msg').innerText='Failed: '+e;});"
+        "}catch(e){fullBlob=file;thumbBlob=null;}"
+        "try{"
+        "document.getElementById('msg').innerText='Uploading photo...';"
+        "var r1=await fetch('/upload/'+encodeURIComponent(name),{method:'POST',body:fullBlob});"
+        "var t1=await r1.text();"
+        "if(thumbBlob){"
+        "document.getElementById('msg').innerText='Uploading thumbnail...';"
+        "var r2=await fetch('/upload/'+encodeURIComponent(thumbName),{method:'POST',body:thumbBlob});"
+        "await r2.text();"
+        "document.getElementById('msg').innerText=t1+' + thumbnail';"
+        "}else{"
+        "document.getElementById('msg').innerText=t1+' (no thumbnail -- old browser)';"
+        "}"
+        "}catch(e){document.getElementById('msg').innerText='Failed: '+e;}"
         "}"
         "</script>"
         "</body></html>"
@@ -2564,7 +3108,13 @@ def handle_upload_connection(conn):
         else:
             dest_dir = PHOTO_DIR
         ulog("handle_upload: receiving " + filename + " length=" + str(length) + " -> " + dest_dir)
-        receive_file_to(conn, rest, length, filename, dest_dir)
+        ok = receive_file_to(conn, rest, length, filename, dest_dir)
+        if not ok:
+            ulog("handle_upload: " + filename + " FAILED -- incomplete transfer, not saved")
+            body = b"FAILED incomplete upload, try again: " + filename.encode()
+            conn.send(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() +
+                       b"\r\nConnection: close\r\n\r\n" + body)
+            return
         actual = 0
         try:
             actual = os.stat(dest_dir + "/" + filename)[6]
@@ -2587,15 +3137,25 @@ def handle_upload_connection(conn):
         body = b"OK saved " + filename.encode()
         conn.send(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() +
                    b"\r\nConnection: close\r\n\r\n" + body)
-        if dest_dir == PHOTO_DIR:
-            for fwd_name in load_forward_ips():
-                fwd_ip = resolve_board_ip(fwd_name)
-                if not fwd_ip:
-                    ulog("handle_upload: skip forward to " + fwd_name + " -- not seen on network recently")
-                    continue
-                ulog("handle_upload: forwarding " + filename + " to " + fwd_name + " (" + fwd_ip + ")")
-                ok = forward_upload(fwd_ip, dest_dir + "/" + filename, filename)
-                ulog("handle_upload: forward to " + fwd_name + " " + ("OK" if ok else "FAILED"))
+        # Automatic forward-on-upload disabled: this ran forward_upload()
+        # synchronously inside background_tick(), which every page's main
+        # loop calls every ~10ms regardless of what's on screen -- so any
+        # ordinary phone upload could silently stall the WHOLE board's
+        # responsiveness for as long as the forward took, with no action
+        # from anyone and no way to tell what was happening. That matches
+        # flakiness seen on a board where SEND TO BOARD had never been
+        # pressed. Sending a photo to another board is still available
+        # explicitly via the SEND TO BOARD button (PhotosPage/SDImportPage),
+        # which the user chooses to trigger and can see is happening.
+        # if dest_dir == PHOTO_DIR:
+        #     for fwd_name in load_forward_ips():
+        #         fwd_ip = resolve_board_ip(fwd_name)
+        #         if not fwd_ip:
+        #             ulog("handle_upload: skip forward to " + fwd_name + " -- not seen on network recently")
+        #             continue
+        #         ulog("handle_upload: forwarding " + filename + " to " + fwd_name + " (" + fwd_ip + ")")
+        #         fwd_ok = forward_upload(fwd_ip, dest_dir + "/" + filename, filename)
+        #         ulog("handle_upload: forward to " + fwd_name + " " + ("OK" if fwd_ok else "FAILED"))
         return
 
     conn.send(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
@@ -2705,17 +3265,24 @@ def discovery_tick():
         if discovery_socket is None:
             return
 
-    # broadcast our own name+IP every 15s
+    # broadcast our own name+IP (plus our current GPS fix, if we have
+    # one) every 15s -- lets boards with no GPS module of their own
+    # (or no sky view where they're sitting) pick up a position from
+    # whichever board does, e.g. board 2's GPS, for the footer ticker
+    # and GET WEATHER
+    global last_gps_fix
     now = time.ticks_ms()
     if time.ticks_diff(now, discovery_last_broadcast) >= 15000:
         discovery_last_broadcast = now
         name = get_board_name()
         if name:
             try:
-                msg = ("CLUBBOARD|" + name + "|" + sta.ifconfig()[0]).encode()
+                msg = "CLUBBOARD|" + name + "|" + sta.ifconfig()[0]
+                if last_gps_fix:
+                    msg += "|%.6f|%.6f" % last_gps_fix
                 bsock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 bsock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-                bsock.sendto(msg, ("255.255.255.255", DISCOVERY_PORT))
+                bsock.sendto(msg.encode(), ("255.255.255.255", DISCOVERY_PORT))
                 bsock.close()
             except Exception as e:
                 ulog("discovery: broadcast failed: " + str(e))
@@ -2729,10 +3296,29 @@ def discovery_tick():
         try:
             text = data.decode()
             parts = text.split("|")
-            if len(parts) == 3 and parts[0] == "CLUBBOARD":
+            if len(parts) >= 3 and parts[0] == "CLUBBOARD":
                 other_name, other_ip = parts[1], parts[2]
                 if other_name and other_name != get_board_name():
+                    if other_name not in known_boards:
+                        # first time seeing this board -- auto-add it to
+                        # the forwarding list so members don't have to
+                        # manually tap every discovered board on the
+                        # Wifi page. add_forward_ip() is a no-op if it's
+                        # already saved, so this only ever adds once.
+                        try:
+                            add_forward_ip(other_name)
+                        except Exception:
+                            pass
                     known_boards[other_name] = (other_ip, time.ticks_ms())
+                    # adopt their GPS fix only if we don't already have
+                    # one of our own -- a board with its own real GPS
+                    # reading should never get overwritten by someone
+                    # else's broadcast
+                    if len(parts) >= 5 and last_gps_fix is None:
+                        try:
+                            last_gps_fix = (float(parts[3]), float(parts[4]))
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -2926,9 +3512,8 @@ class PhotosPage(Page):
             self.g.stop()
         except Exception:
             pass
-        err = render_picture_fullscreen(path, self.picked)
+        show_picture_boxed(path, self.picked)
         self.refresh()
-        self.say("Could not show picture: " + err if err else "Back from preview")
 
     def on_delete(self, b):
         if not self.picked:
@@ -3045,6 +3630,7 @@ class PhotosPage(Page):
 
 
 class MemberPhotosPage(PhotosPage):
+    PAGE_LABEL = "MEMBER PHOTOS"
     ROUTE_NAME = "photos"
 
     def __init__(self, num):
@@ -3074,6 +3660,7 @@ class MemberPhotosPage(PhotosPage):
 
 
 class CarPhotosPage(PhotosPage):
+    PAGE_LABEL = "CAR PHOTOS"
     ROUTE_NAME = "carphoto"
 
     def __init__(self, cid):
@@ -3104,6 +3691,7 @@ class CarPhotosPage(PhotosPage):
 
 
 class GeneralPhotosPage(PhotosPage):
+    PAGE_LABEL = "PHOTOS"
     ROUTE_NAME = "genphotos"
 
     # reached straight from the main menu -- browse, upload, rename,
@@ -3122,6 +3710,237 @@ class GeneralPhotosPage(PhotosPage):
 
     def get_back_route(self):
         return "menu"
+
+
+class ClubCarsPage(Page):
+    PAGE_LABEL = "CLUB CARS"
+    # Picture gallery for club car photos, paired thumbnail + full-size.
+    # Two naming conventions are recognised:
+    #   - numeric (manually prepared): "1.jpg" + "1a.jpg", "2.jpg" + "2a.jpg", ...
+    #   - upload-driven (from the wifi upload page's client-side resize):
+    #     "<name>.jpg" + "<name>_thumb.jpg"
+    # Numeric entries sort first (by number), then named ones alphabetically.
+    # Paginated since a real club's photo folder can run to 100+ photos --
+    # a fixed single page stopped anything past the first 10 from ever
+    # being reachable here. Deliberately separate from the general
+    # PhotosPage browser, which lists every file (both halves of each
+    # pair, plus anything else in the folder) as plain text -- this page
+    # shows the actual pictures.
+    COLS = 5
+    ROWS = 2
+    GRID_X0, GRID_Y0 = 12, 46
+    GRID_X1, GRID_Y1 = 628, 404
+    CELL_W = (GRID_X1 - GRID_X0) // COLS
+    CELL_H = (GRID_Y1 - GRID_Y0) // ROWS
+    PAGE_SIZE = COLS * ROWS
+
+    def __init__(self):
+        Page.__init__(self)
+        self.page = 0
+
+    def build(self, g):
+        g.caption(320, 6, "Club Cars", fg=INK, bg=PAGE, font=3, just="CT")
+        g.button(522, 4, 108, 26, "MENU", fg=WHITE, bg=RED, font=1, callback=self.on_menu)
+        self.footer(g)
+        self.help_button(g, "clubcars", "clubcars")
+        self.draw_grid(g)
+
+    def enter(self):
+        self.say(str(len(self.entries)) + " club car photo(s) in " + PHOTO_DIR)
+
+    def scan(self):
+        try:
+            names = os.listdir(PHOTO_DIR)
+        except OSError:
+            names = []
+        nameset = set(names)
+        entries = []
+        seen = set()
+        for f in names:
+            if "." not in f:
+                continue
+            stem, ext = f[:f.rindex(".")], f[f.rindex("."):]
+            if stem.isdigit():
+                full_name = stem + "a" + ext
+                entries.append(((0, int(stem)), "#" + stem, f, full_name if full_name in nameset else None))
+                seen.add(f)
+        for f in names:
+            if f in seen or "." not in f:
+                continue
+            stem, ext = f[:f.rindex(".")], f[f.rindex("."):]
+            if stem.endswith("_thumb"):
+                base = stem[:-len("_thumb")]
+                full_name = base + ext
+                if full_name in nameset:
+                    entries.append(((1, base.lower()), base, f, full_name))
+        entries.sort(key=lambda e: e[0])
+        return entries
+
+    def draw_grid(self, g):
+        self.entries = self.scan()
+        total_pages = max(1, (len(self.entries) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        self.page = max(0, min(self.page, total_pages - 1))
+        page_entries = self.entries[self.page * self.PAGE_SIZE:(self.page + 1) * self.PAGE_SIZE]
+        for i, (key, label, thumb, full) in enumerate(page_entries):
+            col, row = i % self.COLS, i // self.COLS
+            cx = self.GRID_X0 + col * self.CELL_W
+            cy = self.GRID_Y0 + row * self.CELL_H
+            g.button(cx + 2, cy + 2, self.CELL_W - 4, self.CELL_H - 4, "",
+                     fg=WHITE, bg=BTN, font=1, callback=self._tile_handler(thumb, full, label))
+            err = draw_picture_safe(PHOTO_DIR + "/" + thumb, thumb, cx + 6, cy + 6, MAX_DECODE_DIM_THUMB,
+                                     box_w=self.CELL_W - 12, box_h=self.CELL_H - 30)
+            if err:
+                ulog("ClubCarsPage: thumbnail draw failed for " + thumb + ": " + err)
+                g.caption(cx + 6, cy + 6, "?", fg=RED, bg=BTN, font=2)
+            g.caption(cx + 6, cy + self.CELL_H - 18, label[:18], fg=WHITE, bg=BTN, font=1)
+        if not self.entries:
+            g.caption(self.GRID_X0, self.GRID_Y0 + 10,
+                      "No photos found in " + PHOTO_DIR, fg=INK, bg=PAGE, font=1)
+        if total_pages > 1:
+            g.caption(320, 416, "Page %d / %d  (%d photos)" % (self.page + 1, total_pages, len(self.entries)),
+                      fg=INK, bg=PAGE, font=1, just="CT")
+            draw_nav_button(g, self.GRID_X0, 410, 100, 28, "arrow_back", self.page > 0, self.on_prev_page)
+            draw_nav_button(g, self.GRID_X1 - 100, 410, 100, 28, "arrow_forward",
+                             self.page < total_pages - 1, self.on_next_page)
+
+    def _redraw(self):
+        try:
+            self.g.stop()
+        except Exception:
+            pass
+        hdmi.fill(hdmi.fb().colour(PAGE))
+        g = pcgui.GUI()
+        self.g = g
+        g.start()
+        self.build(g)
+
+    def on_prev_page(self, b):
+        self.page -= 1
+        self._redraw()
+
+    def on_next_page(self, b):
+        self.page += 1
+        self._redraw()
+
+    def _tile_handler(self, thumb, full, label):
+        def handler(b):
+            self.on_tile(thumb, full, label)
+        return handler
+
+    def on_tile(self, thumb, full, label):
+        name = full or thumb
+        try:
+            self.g.stop()
+        except Exception:
+            pass
+        self.show_full_with_actions(name)
+        hdmi.fill(hdmi.fb().colour(PAGE))
+        g = pcgui.GUI()
+        self.g = g
+        g.start()
+        self.build(g)
+        self.say(label + ("" if full else " -- no full-size photo found, showed the thumbnail"))
+
+    def on_menu(self, b):
+        self.go("menu")
+
+    def show_full_with_actions(self, name):
+        # richer preview for this page only -- lets a full-size photo be
+        # renamed and/or attached straight to a member's record without
+        # first going through Members -> PHOTO -> browse. The plain
+        # show_picture_boxed() stays untouched for the other callers
+        # (PhotosPage/Events), which already have their own RENAME/USE
+        # PHOTO flows tied to a member or car already picked elsewhere.
+        box_x, box_y = 40, 10
+        box_w, box_h = 560, 460
+        current = [name]
+        closed = [False]
+        gui_ref = [None]
+
+        def build_box():
+            hdmi.fill(hdmi.fb().colour(PAGE))
+            g = pcgui.GUI()
+            g.start()
+            gui_ref[0] = g
+            g.frame(box_x, box_y, box_w, box_h, current[0], fg=WHITE, font=2)
+
+            def on_close(b):
+                closed[0] = True
+            g.button(box_x + box_w - 90, box_y + 4, 80, 22, "CLOSE", fg=WHITE, bg=RED, font=1,
+                     callback=on_close)
+
+            img_y = box_y + 32
+            err = draw_picture_safe(PHOTO_DIR + "/" + current[0], current[0], box_x + 12, img_y,
+                                     MAX_DECODE_DIM_RICH, box_w=box_w - 24, box_h=MAX_DECODE_DIM_RICH)
+            if err:
+                ey = img_y + 10
+                g.caption(box_x + 12, ey, "Could not show picture:", fg=RED, bg=PAGE, font=1)
+                ey += 18
+                for line in err.split("\n"):
+                    g.caption(box_x + 12, ey, line, fg=RED, bg=PAGE, font=1)
+                    ey += 16
+
+            status_y = img_y + MAX_DECODE_DIM_RICH + 8
+            status_box = g.displaybox(box_x + 12, status_y, box_w - 24, 18, "", fg=INK, bg=PAGE, font=1)
+
+            rename_y = status_y + 22
+            g.caption(box_x + 12, rename_y + 6, "Rename to:", fg=WHITE, bg=PAGE, font=1)
+            rename_box = g.textbox(box_x + 110, rename_y, 260, 26, current[0], font=1)
+
+            def on_rename(b):
+                newname = rename_box.value.strip().replace("/", "_")
+                if not newname:
+                    status_box.value = "Type a new name first"
+                    return
+                if "." not in newname:
+                    newname += current[0][current[0].rindex("."):] if "." in current[0] else ".jpg"
+                old_path = PHOTO_DIR + "/" + current[0]
+                new_path = PHOTO_DIR + "/" + newname
+                try:
+                    os.rename(old_path, new_path)
+                except OSError as e:
+                    status_box.value = "Rename failed: " + str(e)
+                    return
+                old_name = current[0]
+                db.execute("UPDATE events SET photo=? WHERE photo=?", (newname, old_name))
+                db.execute("UPDATE members SET photo=? WHERE photo=?", (newname, old_name))
+                db.execute("UPDATE cars SET photo=? WHERE photo=?", (newname, old_name))
+                current[0] = newname
+                try:
+                    gui_ref[0].stop()
+                except Exception:
+                    pass
+                build_box()
+
+            g.button(box_x + 380, rename_y, 90, 28, "RENAME", fg=WHITE, bg=BTN, font=1, callback=on_rename)
+
+            attach_y = rename_y + 36
+            g.caption(box_x + 12, attach_y + 6, "Member #:", fg=WHITE, bg=PAGE, font=1)
+            member_box = g.textbox(box_x + 110, attach_y, 100, 26, "", font=1)
+
+            def on_attach(b):
+                text = member_box.value.strip()
+                if not text.isdigit():
+                    status_box.value = "Type a member number first"
+                    return
+                m = get_member(int(text))
+                if not m:
+                    status_box.value = "No member #" + text
+                    return
+                set_photo(m[0], current[0])
+                status_box.value = "Attached to " + (m[1] or "") + " (#" + text + ")"
+
+            g.button(box_x + 230, attach_y, 220, 28, "ATTACH TO MEMBER", fg=WHITE, bg=BTN, font=1,
+                     callback=on_attach)
+
+        build_box()
+        while not closed[0]:
+            gui_ref[0].poll()
+            time.sleep_ms(10)
+        try:
+            gui_ref[0].stop()
+        except Exception:
+            pass
 
 
 class CalculatorPage(Page):
@@ -3426,7 +4245,7 @@ class CalculatorPage(Page):
 # .model files aren't worth carrying forward -- but BOX/LINE/CIRCLE/ARC
 # still parse without their newest field(s), defaulting to "Layer1", so
 # v2 files still open rather than silently losing content.
-def serialize_model(boxes, lines, circles, arcs, polys, grid, layers, layer_visible):
+def serialize_model(boxes, lines, circles, arcs, polys, grids, layers, layer_visible):
     out = []
     for (c0, c1, layer) in boxes:
         out.append("BOX %g %g %g %g %g %g %s" % (c0[0], c0[1], c0[2], c1[0], c1[1], c1[2], layer))
@@ -3439,8 +4258,9 @@ def serialize_model(boxes, lines, circles, arcs, polys, grid, layers, layer_visi
     for (points, plane, height, layer) in polys:
         coords = " ".join("%g %g %g" % (p[0], p[1], p[2]) for p in points)
         out.append("POLY %s %g %d %s %s" % (plane, height, len(points), coords, layer))
-    if grid:
-        plane, spacing, extent_i, extent_j, position = grid
+    # one GRID line per active plane -- up to one per XY/XZ/YZ, not just
+    # a single grid, so a file can reopen with more than one grid active
+    for plane, (spacing, extent_i, extent_j, position) in grids.items():
         out.append("GRID %s %g %g %g %g" % (plane, spacing, extent_i, extent_j, position))
     for name in layers:
         out.append("LAYER %s %d" % (name, 1 if layer_visible.get(name, True) else 0))
@@ -3449,7 +4269,7 @@ def serialize_model(boxes, lines, circles, arcs, polys, grid, layers, layer_visi
 
 def parse_model(text):
     boxes, lines, circles, arcs, polys = [], [], [], [], []
-    grid = None
+    grids = {}
     layers = []
     layer_visible = {}
     for line in text.split("\n"):
@@ -3496,22 +4316,24 @@ def parse_model(text):
                        for k in range(n)]
                 polys.append((pts, plane, height, parts[need]))
         elif parts[0] == "GRID" and len(parts) >= 6:
-            grid = (parts[1], float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5]))
+            # keyed by plane, not overwriting a single value -- a saved
+            # file can have more than one GRID line (one per plane)
+            grids[parts[1]] = (float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5]))
         elif parts[0] == "GRID" and len(parts) >= 5:
             # pre-independent-extents save: one extent, applied to both axes
-            grid = (parts[1], float(parts[2]), float(parts[3]), float(parts[3]), float(parts[4]))
+            grids[parts[1]] = (float(parts[2]), float(parts[3]), float(parts[3]), float(parts[4]))
         elif parts[0] == "GRID" and len(parts) >= 4:
-            grid = (parts[1], float(parts[2]), float(parts[3]), float(parts[3]), 0.0)
+            grids[parts[1]] = (float(parts[2]), float(parts[3]), float(parts[3]), 0.0)
         elif parts[0] == "LAYER" and len(parts) >= 3:
             layers.append(parts[1])
             layer_visible[parts[1]] = parts[2] != "0"
     if not layers:
         layers = ["Layer1"]
         layer_visible = {"Layer1": True}
-    return boxes, lines, circles, arcs, polys, grid, layers, layer_visible
+    return boxes, lines, circles, arcs, polys, grids, layers, layer_visible
 
 
-def save_model_file(name, boxes, lines, circles, arcs, polys, grid, layers, layer_visible):
+def save_model_file(name, boxes, lines, circles, arcs, polys, grids, layers, layer_visible):
     try:
         os.mkdir(MODELS_DIR)
     except OSError:
@@ -3519,7 +4341,7 @@ def save_model_file(name, boxes, lines, circles, arcs, polys, grid, layers, laye
     path = MODELS_DIR + "/" + name + ".model"
     f = open(path, "w")
     try:
-        f.write(serialize_model(boxes, lines, circles, arcs, polys, grid, layers, layer_visible))
+        f.write(serialize_model(boxes, lines, circles, arcs, polys, grids, layers, layer_visible))
     finally:
         f.close()
     return path
@@ -3730,6 +4552,99 @@ def _box_corner_triangles(b0, b1, b2, b3, t0, t1, t2, t3):
     quad(b2, b3, t3, t2)
     quad(b3, b0, t0, t3)
     return tris
+
+
+def _find_wall_hole_pairs(boxes):
+    # STL-export-only detection: which boxes look like a hole punched
+    # through another box's wall -- box j counts as a hole in wall i
+    # when j spans wall i's FULL range on some axis (punches all the
+    # way through) while sitting STRICTLY inside wall i's footprint on
+    # the other two axes (away from the edges, not just touching --
+    # that distinguishes an embedded hole from two walls that happen
+    # to meet/overlap at a shared edge or corner). There's no boolean/
+    # subtract operation in this editor -- a "hole" box has always
+    # just been solid material sitting inside the wall, which prints
+    # as either a merged blob (hole invisible) or a lump on the inner
+    # face, depending on exactly how the slicer resolves the overlap.
+    # This only affects STL export; the editor still shows/treats
+    # holes as ordinary solid boxes.
+    n = len(boxes)
+    wall_holes = {}   # wall index -> [(hole_c0, hole_c1, through_axis), ...]
+    hole_idxs = set()
+    for i in range(n):
+        c0, c1, _ = boxes[i]
+        for j in range(n):
+            if i == j:
+                continue
+            d0, d1, _ = boxes[j]
+            for axis in range(3):
+                other = [a for a in range(3) if a != axis]
+                if not (d0[axis] <= c0[axis] and d1[axis] >= c1[axis]):
+                    continue
+                if all(c0[a] < d0[a] and d1[a] < c1[a] for a in other):
+                    wall_holes.setdefault(i, []).append((d0, d1, axis))
+                    hole_idxs.add(j)
+                    break
+    return wall_holes, hole_idxs
+
+
+def _rect_minus_hole_3d(p0, p1, hd0, hd1, i, j):
+    # splits one 3D box (p0,p1) into up to 4 boxes covering it minus
+    # the footprint of (hd0,hd1) on axes i/j -- the classic "frame"
+    # decomposition (bottom/top strips full width, left/right strips
+    # only the hole's own span) also used by the RADIUS corner fix,
+    # just with the cut in the middle instead of at a corner. Whatever
+    # third axis isn't i or j (the wall's through-direction) is left
+    # at this piece's own full range on every strip, untouched.
+    strips = []
+    lo_i, hi_i = hd0[i], hd1[i]
+    lo_j, hi_j = hd0[j], hd1[j]
+    if lo_j > p0[j]:
+        b0, b1 = list(p0), list(p1)
+        b1[j] = lo_j
+        strips.append((tuple(b0), tuple(b1)))
+    if hi_j < p1[j]:
+        b0, b1 = list(p0), list(p1)
+        b0[j] = hi_j
+        strips.append((tuple(b0), tuple(b1)))
+    if lo_i > p0[i]:
+        b0, b1 = list(p0), list(p1)
+        b1[i] = lo_i
+        b0[j], b1[j] = lo_j, hi_j
+        strips.append((tuple(b0), tuple(b1)))
+    if hi_i < p1[i]:
+        b0, b1 = list(p0), list(p1)
+        b0[i] = hi_i
+        b0[j], b1[j] = lo_j, hi_j
+        strips.append((tuple(b0), tuple(b1)))
+    return strips
+
+
+def _wall_with_holes_pieces(c0, c1, holes):
+    # applies _rect_minus_hole_3d once per hole -- clips each hole's
+    # footprint against every CURRENT piece it actually overlaps
+    # (not just one piece it fits entirely inside), since an earlier
+    # hole's cut can leave a later hole straddling more than one
+    # piece whenever holes have different depths on the shared axis
+    # (e.g. one hole spans Z 9-15 and another spans Z 10-17 -- after
+    # the first hole splits the wall, the second no longer fits
+    # cleanly inside any single remaining piece)
+    pieces = [(c0, c1)]
+    for hd0, hd1, axis in holes:
+        other = [a for a in range(3) if a != axis]
+        i, j = other
+        new_pieces = []
+        for p0, p1 in pieces:
+            clo_i, chi_i = max(p0[i], hd0[i]), min(p1[i], hd1[i])
+            clo_j, chi_j = max(p0[j], hd0[j]), min(p1[j], hd1[j])
+            if clo_i >= chi_i or clo_j >= chi_j:
+                new_pieces.append((p0, p1))  # this piece doesn't overlap the hole at all
+                continue
+            ch0 = list(p0); ch0[i] = clo_i; ch0[j] = clo_j
+            ch1 = list(p1); ch1[i] = chi_i; ch1[j] = chi_j
+            new_pieces.extend(_rect_minus_hole_3d(p0, p1, tuple(ch0), tuple(ch1), i, j))
+        pieces = new_pieces
+    return pieces
 
 
 def _box_triangles(c0, c1):
@@ -3997,45 +4912,102 @@ def _wall_radius_pie(boxA, boxB, radius):
     return (tuple(a0), tuple(a1)), (tuple(b0), tuple(b1)), pie_points, (z1 - z0)
 
 
-def _box_corner_pie(box, x_side, y_side, radius):
-    # rounds ONE box's own corner directly -- x_side/y_side are each
-    # "min" or "max", picking which of its 4 vertical corners. Same
-    # trim-and-fill-with-a-quarter-cylinder idea as _wall_radius_pie,
-    # just without needing a second box to find the corner from.
-    c0, c1 = list(box[0]), list(box[1])
-    x_len, y_len = c1[0] - c0[0], c1[1] - c0[1]
-    if radius <= 0 or radius >= x_len or radius >= y_len:
-        raise ValueError("radius too large for this box")
-    corner_x = c0[0] if x_side == "min" else c1[0]
-    corner_y = c0[1] if y_side == "min" else c1[1]
+def _round_rect_corner(points, x_side, y_side, radius):
+    # rounds ONE corner of a rectangle-derived outline -- x_side/y_side
+    # ("min"/"max" each) identify the target corner by `points`' own
+    # bounding box, same convention _box_corner_pie/_nearest_rect_corner
+    # use. `points` can be a box's plain 4-corner outline (see
+    # _box_corner_pie) OR a POLY that's already had one or more of its
+    # OTHER corners rounded by an earlier RADIUS -- letting RADIUS be
+    # used repeatedly on the same shape (all 4 corners of a plate, say)
+    # instead of only once. A tangent point on either adjacent edge
+    # always sits exactly on that edge's original line, so the target
+    # corner's still-plain vertex is easy to find directly, and the
+    # outline's bounding box keeps identifying the same 4 logical
+    # corners no matter how many of them have already been rounded.
+    # Raises ValueError if that corner isn't a plain (not yet rounded)
+    # vertex in `points`, or the radius doesn't fit either adjacent edge.
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    corner_x = x0 if x_side == "min" else x1
+    corner_y = y0 if y_side == "min" else y1
+    target = None
+    for idx, p in enumerate(points):
+        if abs(p[0] - corner_x) < 1e-6 and abs(p[1] - corner_y) < 1e-6:
+            target = idx
+            break
+    if target is None:
+        raise ValueError("that corner is already rounded")
+    z0 = points[0][2]
+    n = len(points)
+    prev_pt = points[(target - 1) % n]
+    next_pt = points[(target + 1) % n]
+    # math.sqrt, not math.hypot -- this board's MicroPython math module
+    # doesn't implement hypot (see _point_to_segment_dist)
+    edge_prev = math.sqrt((prev_pt[0] - corner_x) ** 2 + (prev_pt[1] - corner_y) ** 2)
+    edge_next = math.sqrt((next_pt[0] - corner_x) ** 2 + (next_pt[1] - corner_y) ** 2)
+    if radius <= 0 or radius >= edge_prev or radius >= edge_next:
+        raise ValueError("radius too large for this corner")
     dir_x = 1.0 if x_side == "min" else -1.0
     dir_y = 1.0 if y_side == "min" else -1.0
-    if x_side == "min":
-        c0[0] += radius
-    else:
-        c1[0] -= radius
-    if y_side == "min":
-        c0[1] += radius
-    else:
-        c1[1] -= radius
-
     center = (corner_x + dir_x * radius, corner_y + dir_y * radius)
-    edge_x_pt = (center[0], corner_y)   # meets the X-trimmed edge, at the untrimmed Y extreme
-    edge_y_pt = (corner_x, center[1])   # meets the Y-trimmed edge, at the untrimmed X extreme
+    edge_x_pt = (center[0], corner_y)   # tangent point on the edge running along X
+    edge_y_pt = (corner_x, center[1])   # tangent point on the edge running along Y
+
+    # walking the outline counter-clockwise, which tangent point is
+    # reached FIRST depends on which corner is being rounded: min/min
+    # and max/max enter via the Y-running edge and leave via the
+    # X-running edge; max/min and min/max are the other way around
+    # (confirmed against a numeric CCW-winding check across all four,
+    # not just one case)
+    if x_side == y_side:
+        enter_pt, leave_pt = edge_y_pt, edge_x_pt
+    else:
+        enter_pt, leave_pt = edge_x_pt, edge_y_pt
 
     def ang(pt):
         return math.degrees(math.atan2(pt[1] - center[1], pt[0] - center[0]))
-    a0deg, a1deg = ang(edge_y_pt), ang(edge_x_pt)
-    delta = (a1deg - a0deg + 180) % 360 - 180
+    a0deg, a1deg = ang(enter_pt), ang(leave_pt)
+    delta = (a1deg - a0deg + 180) % 360 - 180  # shortest signed turn, always the 90deg way
 
-    z0, z1 = box[0][2], box[1][2]
     segs = max(2, int(round(8 * abs(delta) / 90.0)))
-    pie_points = [(center[0], center[1], z0)]
+    arc_pts = []
     for i in range(segs + 1):
         deg = math.radians(a0deg + delta * i / segs)
-        pie_points.append((center[0] + radius * math.cos(deg), center[1] + radius * math.sin(deg), z0))
+        arc_pts.append((center[0] + radius * math.cos(deg), center[1] + radius * math.sin(deg), z0))
 
-    return (tuple(c0), tuple(c1)), pie_points, (z1 - z0)
+    return points[:target] + arc_pts + points[target + 1:]
+
+
+def _box_corner_pie(box, x_side, y_side, radius):
+    # rounds ONE box's own corner for the FIRST time -- x_side/y_side
+    # are each "min" or "max", picking which of its 4 vertical corners.
+    # Starts from the box's own plain 4-corner outline and hands off to
+    # _round_rect_corner (which also handles rounding a SECOND, third,
+    # or fourth corner of the same shape once it's already a POLY from
+    # an earlier RADIUS -- see that function). Replaces the box
+    # entirely with a SINGLE rounded-rectangle POLY, extruded as one
+    # solid via _poly_solid_triangles -- not split into separate pieces
+    # plus a wedge (an earlier version of this did that, and got the
+    # arc's winding backwards on two of the four corners, producing an
+    # inverted, indented wedge on half of them). A single polygon also
+    # can't develop a seam between pieces, and can't be mistaken for a
+    # hole by the STL export's wall-hole detection the way a small
+    # separate corner piece could.
+    #
+    # Trimming a single box's corner point directly (an even earlier
+    # approach, before either of the above) shrank it across its FULL
+    # width/depth on that axis, not just near the corner, since a box
+    # is one axis-aligned rectangle with no way to represent a local
+    # notch on its own -- fine for a wall (long in one direction, thin
+    # in the other) but visibly wrong for something wide in both X and
+    # Y, like a floor plate.
+    (x0, y0, z0), (x1, y1, z1) = box
+    rect = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0)]
+    poly_points = _round_rect_corner(rect, x_side, y_side, radius)
+    return poly_points, (z1 - z0)
 
 
 STL_DIR = "/sd/stl"
@@ -4068,7 +5040,211 @@ def save_stl_file(name, triangles):
     return path
 
 
+class GPSPage(Page):
+    # dedicated full-screen GPS readout -- separate from the compact
+    # "GPS: lat, lon" snippet every page's footer ticker already shows
+    # (see Page._live_ticker_info, and Menu.page_tick() which polls
+    # read_gps_fix() every 20s in the background). Does a full read
+    # (lat/lon/UTC/speed/course/altitude/satellites) via GET FIX, and
+    # also auto-refreshes both the fix and the weather periodically
+    # while this page is open (see AUTO_GPS_INTERVAL_MS/
+    # AUTO_WEATHER_INTERVAL_MS) so it doesn't just sit showing a
+    # one-time snapshot -- also shows whatever the menu's background
+    # poll last found on entry so there's something on screen immediately.
+    def __init__(self):
+        Page.__init__(self)
+        self.reading = False
+        self.gps_reader = None
+        self.read_start = 0
+        self.fix_found_at = None
+        self._last_status_update = 0
+        self.auto_gps_last = time.ticks_ms()
+        self.auto_weather_last = time.ticks_ms()
+
+    def build(self, g):
+        g.caption(320, 6, "GPS", fg=INK, bg=PAGE, font=3, just="CT")
+        g.frame(20, 40, 600, 170, "Current Fix", fg=INK, font=1)
+        self.latlon_box = g.displaybox(30, 64, 580, 26, "Lat: --   Lon: --", fg=INK, bg=PAGE, font=2)
+        self.alt_box = g.displaybox(30, 94, 580, 26, "Altitude: --", fg=INK, bg=PAGE, font=2)
+        self.speed_box = g.displaybox(30, 124, 580, 26, "Speed: --   Course: --", fg=INK, bg=PAGE, font=2)
+        self.sats_box = g.displaybox(30, 154, 580, 26, "Satellites: --", fg=INK, bg=PAGE, font=2)
+        self.utc_box = g.displaybox(30, 184, 580, 26, "GPS time (UTC): --", fg=INK, bg=PAGE, font=2)
+        g.button(20, 230, 280, 56, "GET FIX", fg=WHITE, bg=BTN, font=3, callback=self.on_get_fix)
+        g.button(324, 230, 280, 56, "MENU", fg=WHITE, bg=RED, font=3, callback=self.on_back)
+
+        g.frame(20, 296, 600, 130, "Weather", fg=INK, font=1)
+        self.weather_line1 = g.displaybox(30, 320, 580, 26, "Press GET WEATHER for current conditions",
+                                           fg=INK, bg=PAGE, font=2)
+        self.weather_line2 = g.displaybox(30, 350, 580, 26, "", fg=INK, bg=PAGE, font=2)
+        g.button(30, 384, 200, 34, "GET WEATHER", fg=WHITE, bg=BTN, font=2, callback=self.on_get_weather)
+
+        self.footer(g)
+        self.help_button(g, "gps", "menu")
+
+    def enter(self):
+        global last_gps_fix
+        if last_gps_fix:
+            lat, lon = last_gps_fix
+            self.latlon_box.value = "Lat: %.6f   Lon: %.6f" % (lat, lon)
+            self.say("Showing last known fix -- press GET FIX to refresh")
+        else:
+            self.say("No fix yet -- press GET FIX")
+
+    def _show_fix(self, lat, lon, utc, speed_kn, course_deg, altitude_m, num_sats, fix_quality):
+        self.latlon_box.value = "Lat: %.6f   Lon: %.6f" % (lat, lon)
+        if altitude_m is not None:
+            self.alt_box.value = "Altitude: %.1f m" % altitude_m
+        else:
+            self.alt_box.value = "Altitude: --"
+        speed_txt = "Speed: %.1f knots (%.1f km/h)" % (speed_kn, speed_kn * 1.852) if speed_kn is not None else "Speed: --"
+        course_txt = "Course: %.0f deg" % course_deg if course_deg is not None else "Course: --"
+        self.speed_box.value = speed_txt + "   " + course_txt
+        if num_sats is not None:
+            self.sats_box.value = "Satellites: %d   (fix quality %s)" % (num_sats, fix_quality)
+        else:
+            self.sats_box.value = "Satellites: --"
+        if utc:
+            yy, mo, dd, hh, mi, ss = utc
+            self.utc_box.value = "GPS time (UTC): %04d-%02d-%02d %02d:%02d:%02d" % (yy, mo, dd, hh, mi, ss)
+        else:
+            self.utc_box.value = "GPS time (UTC): --"
+
+    # a cold start (module just powered up, no almanac yet) can take
+    # 30s-2min outdoors to get its first fix, so this budget is much
+    # longer than the 4s default used for a quick background refresh
+    # elsewhere -- but driven from page_tick() one poll at a time (see
+    # below) rather than blocking, so the screen/ticker stay alive
+    # instead of looking frozen for up to a minute.
+    READ_TIMEOUT_MS = 120000
+    # how often this page refreshes itself without a button press --
+    # GPS is cheap/fast once already locked (a "hot" refresh usually
+    # finishes in 1-4s, the 60s ceiling above is really just a safety
+    # cap for a lost lock), so 15s keeps position current without
+    # hammering the module. Weather is a network round-trip and only
+    # meaningfully changes slowly, so that one is much less frequent.
+    AUTO_GPS_INTERVAL_MS = 15000
+    AUTO_WEATHER_INTERVAL_MS = 150000  # ~2.5 minutes
+
+    def _start_read(self):
+        if self.reading:
+            return  # already in progress
+        self.gps_reader = GPSReader()
+        if self.gps_reader.err:
+            self.say(self.gps_reader.err)
+            self.gps_reader = None
+            return
+        self.reading = True
+        self.read_start = time.ticks_ms()
+        self.fix_found_at = None
+        self._last_status_update = 0
+        self.say("Reading GPS ... this can take a minute or more on a cold start")
+
+    def on_get_fix(self, b):
+        self._start_read()
+
+    def page_tick(self):
+        now = time.ticks_ms()
+        # weather's own auto-refresh check lives outside the "already
+        # reading GPS" gate below -- a board with no GPS module wired
+        # (using a fix picked up via discovery broadcast instead, see
+        # discovery_tick) can sit in self.reading=True almost
+        # permanently, since every local read attempt times out with
+        # nothing ever responding on the UART. Weather must not get
+        # starved just because local GPS reads are hopeless here.
+        if time.ticks_diff(now, self.auto_weather_last) >= self.AUTO_WEATHER_INTERVAL_MS:
+            self._auto_fetch_weather()
+        if not self.reading:
+            # auto-refresh trigger -- only when not already mid-read,
+            # so a slow cold start doesn't get interrupted/restarted
+            if time.ticks_diff(now, self.auto_gps_last) >= self.AUTO_GPS_INTERVAL_MS:
+                self.auto_gps_last = now
+                self._start_read()
+            if not self.reading:
+                return
+        reader = self.gps_reader
+        reader.poll_once()
+        if reader.err:
+            self.reading = False
+            self.say(reader.err)
+            return
+        if reader.has_fix():
+            if reader.gga_extra[0] is not None:
+                self._finish_fix(reader)
+                return
+            if self.fix_found_at is None:
+                self.fix_found_at = now
+            elif time.ticks_diff(now, self.fix_found_at) >= 3000:
+                self._finish_fix(reader)
+                return
+        elapsed = time.ticks_diff(now, self.read_start)
+        if elapsed >= self.READ_TIMEOUT_MS:
+            self.reading = False
+            if reader.has_fix():
+                self._finish_fix(reader)
+            else:
+                self.say(reader.no_fix_message())
+            return
+        # live progress, updated at most twice a second so it doesn't
+        # spam the ticker -- this is what proves the page is still
+        # alive and not frozen during a slow cold start
+        if time.ticks_diff(now, self._last_status_update) >= 500:
+            self._last_status_update = now
+            self.say("Reading GPS ... %ds elapsed, %d sentence(s) seen" % (elapsed // 1000, reader.sentences_seen))
+
+    def _finish_fix(self, reader):
+        global last_gps_fix
+        self.reading = False
+        lat, lon, utc, speed_kn, course_deg, altitude_m, num_sats, fix_quality = reader.result()
+        last_gps_fix = (lat, lon)
+        self._show_fix(lat, lon, utc, speed_kn, course_deg, altitude_m, num_sats, fix_quality)
+        self.say("Fix acquired")
+
+    def on_back(self, b):
+        self.go("menu")
+
+    def _do_weather_fetch(self):
+        # shared by the manual GET WEATHER button and the automatic
+        # periodic refresh -- blocking (bounded by fetch_weather's own
+        # socket timeout), same tradeoff the button already had. Runs
+        # far less often than GPS's own auto-refresh (every ~2.5min vs
+        # 15s) since conditions don't change fast enough to justify
+        # more, and a network call is a heavier/less predictable stall
+        # than a UART read if it ever hangs.
+        global last_gps_fix, last_weather
+        lat, lon = last_gps_fix
+        self.weather_line1.value = "Fetching weather ... please wait"
+        self.weather_line2.value = ""
+        cw, err = fetch_weather(lat, lon)
+        if cw is None:
+            self.weather_line1.value = err
+            self.weather_line2.value = ""
+            return
+        temp = cw.get("temperature")
+        wind = cw.get("windspeed")
+        code = cw.get("weathercode")
+        desc = weather_code_text(code) if code is not None else "Unknown conditions"
+        self.weather_line1.value = ("%s, %.1f C" % (desc, temp)) if temp is not None else desc
+        self.weather_line2.value = ("Wind: %.1f km/h" % wind) if wind is not None else ""
+        last_weather = (desc, temp, wind)
+
+    def on_get_weather(self, b):
+        global last_gps_fix
+        if not last_gps_fix:
+            self.weather_line1.value = "No GPS fix yet -- press GET FIX first"
+            self.weather_line2.value = ""
+            return
+        self._do_weather_fetch()
+
+    def _auto_fetch_weather(self):
+        global last_gps_fix
+        if not last_gps_fix:
+            return  # nothing to fetch for yet -- don't reset the timer, just retry next tick
+        self.auto_weather_last = time.ticks_ms()
+        self._do_weather_fetch()
+
+
 class Model3DPage(Page):
+    PAGE_LABEL = "3D MODEL EDITOR"
     # window chrome: an 8px grey border framing the whole 640x480
     # screen, drawn as concentric 1px g.frame() outlines (this app's
     # only bordered-box primitive) since there's no filled-rect call
@@ -4090,13 +5266,16 @@ class Model3DPage(Page):
     PANEL_W = 56
     PANEL_H = 400
 
-    # CMD_BTN_H has shrunk twice now (40->34->30, icons 32->26->22px)
-    # to keep fitting more buttons in the same panel height as they've
-    # been added.
+    # CMD_BTN_H has shrunk repeatedly (40->34->30->26->22) to keep fitting
+    # more buttons in the same panel height as they've been added --
+    # at 26px, 14 buttons already ran past y=480 (the last one or two
+    # were off the bottom of the screen); adding MEASURE as the 15th
+    # made that impossible to ignore, so this shrink also fixes that
+    # pre-existing overflow, not just makes room for the new button.
     COMMANDS = ("NEW FILE", "OPEN", "SAVE AS", "DELETE", "SELECT", "LINE", "CTR LINE",
-                "BOX", "CIRCLE", "ARC", "MULTI LINE", "RADIUS", "GRID", "TEMPLATE")
-    CMD_BTN_H = 26  # shrunk again (30->26, icons 22->18px) to fit SELECT as an 11th button
-    CMD_BTN_GAP = 5
+                "BOX", "CIRCLE", "ARC", "MULTI LINE", "RADIUS", "GRID", "TEMPLATE", "MEASURE", "COLOUR")
+    CMD_BTN_H = 20
+    CMD_BTN_GAP = 3
 
     # centred modal dialog box used by NEW FILE / SAVE AS / DELETE --
     # width/x are shared, height/y vary per dialog since NEW FILE needs
@@ -4264,6 +5443,20 @@ class Model3DPage(Page):
         self.dialog = None        # None, "open", "saveas", "delete", "line",
                                    # "box", "circle", or "arc"
         self.model_name = "mycar"
+        self.dirty = False  # True once anything's changed since the last SAVE AS/OPEN/NEW FILE --
+                             # set by _push_undo() (called before every mutation), cleared on a
+                             # successful save/load/new. Drives the "unsaved changes" prompt on MENU.
+        self.origin_offset = (0.0, 0.0, 0.0)  # added to every TYPED X/Y/Z point (BOX/LINE corners,
+                                               # ARC centre) before it's stored, so "0,0,0" can be
+                                               # typed to mean wherever you set the origin to instead
+                                               # of the model's true origin -- lets you work out
+                                               # coordinates relative to one layer's own reference
+                                               # point. Click-to-place (CIRCLE, MULTI LINE, BOX/LINE's
+                                               # CLICK ON GRID mode) always uses real/absolute
+                                               # coordinates, unaffected by this. RESTORE ORIGIN (in
+                                               # the LAYERS dialog) resets it to (0,0,0) -- doesn't
+                                               # move anything already placed, since the offset is
+                                               # only ever applied once, at creation time.
         self.stl_strut_thickness = 4.0  # mm -- default cross-section for solidified LINE/CIRCLE/ARC edges
         self.last_stl_path = None    # /sd/stl/<name>.stl of the most recent EXPORT STL, for SEND TO BOARD
         self.last_stl_name = None
@@ -4274,12 +5467,26 @@ class Model3DPage(Page):
         self.circles = []           # list of ((cx,cy,cz), radius, plane)
         self.arcs = []               # list of ((cx,cy,cz), radius, plane, start_deg, end_deg)
         self.polys = []              # list of (points, plane, extrude_height, layer) -- see MULTI LINE
+        # (kind, idx) -> RGB int, deliberately kept OUTSIDE the box/line/
+        # circle/arc/poly tuples themselves and never passed into the main
+        # _draw_scene geometry calls -- swapping the draw colour there was
+        # already tried once (for selection highlighting) and made
+        # geometry vanish entirely on real hardware for reasons never
+        # diagnosed (see _draw_scene). Colour is shown as a small
+        # additive marker instead, the same safe technique selection
+        # already uses, layered on top rather than replacing anything.
+        self.element_colors = {}
+        self.colour_r = self.colour_g = self.colour_b = True  # COLOUR dialog's 3 toggles
         self.multiline_points = []   # points placed so far in the current MULTI LINE pick
         self.multiline_target = 0    # how many points MULTI LINE is waiting for
-        self.radius_pick_a = None    # index into self.boxes of RADIUS's first picked wall
-        self.radius_pick_b = None    # index into self.boxes of RADIUS's second picked wall
-        self.radius_corner_side = None  # (x_side, y_side) once a single box's own corner is picked
+        self.multiline_edit_idx = None  # index into self.polys being re-pointed by EDIT, or None
+        self.radius_pick_a = None    # (kind, idx) -- kind is "box" or "poly" -- of RADIUS's first picked wall
+        self.radius_pick_b = None    # (kind, idx) of RADIUS's second picked wall
+        self.radius_corner_side = None  # (x_side, y_side) once a single shape's own corner is picked
         self._radius_dialog_message = ""
+        self._radius_amount_pending = None  # preserves whatever's typed across a redraw (e.g. a
+                                             # failed-validation retry) -- same fix as CIRCLE's own
+                                             # radius field already has via _circle_radius_pending
 
         self.line_start_point = None
         self.line_stage = "start"  # "start" or "end", within the LINE dialog
@@ -4292,11 +5499,21 @@ class Model3DPage(Page):
                                         # before creating new ones so repeated lightweight _draw_scene()
                                         # calls (e.g. live mouse polling) don't pile up stale duplicates
         self.arc_plane = "XY"      # same, within the ARC dialog
-        self.grid_plane = "XY"     # same, within the GRID dialog
-        self.grid = None          # (plane, spacing, extent_i, extent_j, position) or None -- one
-                                   # grid at a time, a fresh GRID replaces whatever grid was there
+        self.grid_plane = "XY"     # which plane the GRID dialog is currently set to edit/create
+        self.grids = {}           # plane -> (spacing, extent_i, extent_j, position) -- up to one
+                                   # grid per plane (XY/XZ/YZ) can be active simultaneously; a fresh
+                                   # GRID replaces only that one plane's grid, not the others
+        self.grid_plane_visible = {}  # plane -> bool, missing/True means visible -- lets each
+                                       # plane's grid be shown/hidden independently (self.grid_visible
+                                       # above is the master switch for ALL grids together; this is
+                                       # per-plane on top of that). Not persisted to the .model file --
+                                       # just a display preference for the current editing session.
+        self.grid_current_plane = None  # plane of whichever grid was most recently created/edited --
+                                         # used to resolve snapping that isn't itself tied to a specific
+                                         # plane (typed numeric values, and VIEW clicks for LINE/BOX/
+                                         # MEASURE) when more than one grid is active
         self.snap_enabled = True  # master switch -- grid snapping only actually applies
-                                   # when this is True AND self.grid is set
+                                   # when this is True AND a relevant grid is set
         self.centerline_axis = "X"  # cycles X -> Y -> Z, within the CTR LINE dialog
 
         # layers -- every box/line/circle/arc is tagged with the name
@@ -4332,6 +5549,7 @@ class Model3DPage(Page):
         self._last_origin = (0.0, 0.0)    # used by on_touch to report a model-space position
 
         self.box_pick_start = None  # BOX's "CLICK ON GRID" mode -- first corner, or None
+        self.measure_start = None  # MEASURE's first clicked point, or None
 
         # diagnostic only -- counts every on_touch call regardless of
         # dialog state, logged via ulog() so a hardware test can tell
@@ -4470,6 +5688,8 @@ class Model3DPage(Page):
             self._build_arc_dialog(g)
         elif self.dialog == "multiline":
             self._build_multiline_dialog(g)
+        elif self.dialog == "multiline_type":
+            self._build_multiline_type_dialog(g)
         elif self.dialog == "radius":
             self._build_radius_dialog(g)
         elif self.dialog == "grid":
@@ -4490,6 +5710,12 @@ class Model3DPage(Page):
             self._build_wireframe_list_dialog(g, "DELETE TEMPLATE", "DELETE", self.on_confirm_delete_template)
         elif self.dialog == "template_new":
             self._build_template_new_dialog(g)
+        elif self.dialog == "colour":
+            self._build_colour_dialog(g)
+        elif self.dialog == "confirm_exit":
+            self._build_confirm_exit_dialog(g)
+        elif self.dialog == "set_origin":
+            self._build_set_origin_dialog(g)
         elif (self.dialog == "line_pick" or self.dialog == "select_pick" or self.dialog == "box_pick"
               or self.dialog == "circle_pick" or self.dialog == "multiline_pick"
               or self.dialog == "radius_pick_a" or self.dialog == "radius_pick_b"
@@ -4508,7 +5734,7 @@ class Model3DPage(Page):
         "OPEN": "open", "SAVE AS": "saveas", "DELETE": "delete",
         "SELECT": "select_pick", "LINE": "line_choice", "CTR LINE": "centerline", "BOX": "box_choice",
         "CIRCLE": "circle", "ARC": "arc", "MULTI LINE": "multiline", "RADIUS": "radius_pick_a",
-        "GRID": "grid", "TEMPLATE": "template",
+        "GRID": "grid", "TEMPLATE": "template", "MEASURE": "measure_pick", "COLOUR": "colour",
     }
 
     def _build_main(self, g):
@@ -4527,7 +5753,7 @@ class Model3DPage(Page):
             # trick CalculatorPage uses for its operator icons
             g.button(btn_x, y, btn_w, self.CMD_BTN_H, "", fg=WHITE, bg=self.BLACK, font=1,
                      callback=self._make_command_handler(name))
-            icon_slots.append((name, btn_x + 4, y + 4))
+            icon_slots.append((name, btn_x + 4, y + 1))  # vertically centred: 20px button, 18px icon
             button_rects.append((name, btn_x, y, btn_w, self.CMD_BTN_H))
             y += self.CMD_BTN_H + self.CMD_BTN_GAP
 
@@ -4536,7 +5762,7 @@ class Model3DPage(Page):
         self.status_box = g.displaybox(self.PANEL_X + self.PANEL_W + 20, self.PANEL_Y,
                                         640 - self.BORDER - (self.PANEL_X + self.PANEL_W + 20) - 8, 24,
                                         "Ready", fg=WHITE, bg=self.BLACK, font=2)
-        snap_status = "grid snap ON" if (self.grid and self.snap_enabled) else "not snapped"
+        snap_status = "grid snap ON" if (self.grids and self.snap_enabled) else "not snapped"
         if self.dialog == "line_pick":
             verb = "START" if self.line_stage == "start" else "END"
             self.status_box.value = "LINE: click %s point in VIEW (%s) -- pick another command to cancel" % (verb, snap_status)
@@ -4550,6 +5776,9 @@ class Model3DPage(Page):
         elif self.dialog == "multiline_pick":
             self.status_box.value = ("MULTI LINE: click point %d/%d in VIEW (%s) -- pick another command to cancel"
                                       % (len(self.multiline_points) + 1, self.multiline_target, snap_status))
+        elif self.dialog == "multiline_edit_pick":
+            self.status_box.value = ("EDIT: click point %d/%d in VIEW (%s) -- pick another command to cancel"
+                                      % (len(self.multiline_points) + 1, self.multiline_target, snap_status))
         elif self.dialog == "radius_pick_a":
             self.status_box.value = "RADIUS: click the FIRST wall in VIEW -- pick another command to cancel"
         elif self.dialog == "radius_pick_b":
@@ -4557,6 +5786,9 @@ class Model3DPage(Page):
                                       "again to round one of its own corners")
         elif self.dialog == "radius_pick_corner":
             self.status_box.value = "RADIUS: click near the CORNER of that box to round -- pick another command to cancel"
+        elif self.dialog == "measure_pick":
+            verb = "FIRST" if self.measure_start is None else "SECOND"
+            self.status_box.value = "MEASURE: click %s point in VIEW (%s) -- pick another command to cancel" % (verb, snap_status)
 
         # temporary readout so mouse/touch input can be confirmed working
         # on real hardware independently of the command buttons above --
@@ -4674,7 +5906,19 @@ class Model3DPage(Page):
             except Exception as e:
                 ulog("Model3DPage: box start marker draw error: " + type(e).__name__ + " " + str(e))
 
-        if self.dialog == "multiline_pick" and self.multiline_points:
+        if self.dialog == "measure_pick" and self.measure_start:
+            try:
+                fb = hdmi.fb()
+                sx, sy = self._project(self.measure_start[0], self.measure_start[1],
+                                        self.measure_start[2], self._last_scale,
+                                        self._last_origin[0], self._last_origin[1])
+                r = 5
+                self._clipped_line(fb, sx - r, sy, sx + r, sy, RED)
+                self._clipped_line(fb, sx, sy - r, sx, sy + r, RED)
+            except Exception as e:
+                ulog("Model3DPage: measure start marker draw error: " + type(e).__name__ + " " + str(e))
+
+        if self.dialog in ("multiline_pick", "multiline_edit_pick") and self.multiline_points:
             # shows the points placed so far, connected in order -- the
             # only feedback available between clicks (no live "follows
             # the mouse" segment, matching every other click-to-place
@@ -4979,7 +6223,9 @@ class Model3DPage(Page):
                         continue
                     self._draw_poly(fb, points, plane, height, scale, ox, oy)
             self._draw_selection_marker(fb, scale, ox, oy)
-            if self.grid and self.grid_visible:
+            if self.element_colors:
+                self._draw_element_colors(fb, scale, ox, oy)
+            if self.grids and self.grid_visible:
                 self._draw_grid_dots(fb, scale, ox, oy)
             if self.template_main:
                 self._draw_template_wireframe(fb, scale, ox, oy, self.template_main)
@@ -4992,12 +6238,10 @@ class Model3DPage(Page):
         except Exception as e:
             ulog("Model3DPage: scene draw error: " + type(e).__name__ + " " + str(e))
 
-    def _selected_center_point(self):
-        # 3D point to mark for whatever's currently selected -- a
-        # midpoint for box/line, the centre itself for circle/arc
-        if not self.selected:
-            return None
-        kind, idx = self.selected
+    def _center_point_for(self, kind, idx):
+        # 3D point to mark for a given element -- a midpoint for
+        # box/line, the centre itself for circle/arc. Shared by the
+        # SELECT marker and the COLOUR marker (see _draw_element_colors).
         try:
             if kind == "box":
                 c0, c1 = self.boxes[idx][0], self.boxes[idx][1]
@@ -5017,6 +6261,11 @@ class Model3DPage(Page):
             return None
         return None
 
+    def _selected_center_point(self):
+        if not self.selected:
+            return None
+        return self._center_point_for(self.selected[0], self.selected[1])
+
     def _draw_selection_marker(self, fb, scale, ox, oy):
         # additive-only feedback for SELECT -- a crosshair drawn ON TOP
         # of the (always-WHITE) selected geometry rather than replacing
@@ -5029,6 +6278,23 @@ class Model3DPage(Page):
         r = 8
         self._clipped_line(fb, mx - r, my, mx + r, my, self.SELECT_COLOR)
         self._clipped_line(fb, mx, my - r, mx, my + r, self.SELECT_COLOR)
+
+    def _draw_element_colors(self, fb, scale, ox, oy):
+        # additive-only, same technique as _draw_selection_marker: a
+        # small filled square at the element's centre in its assigned
+        # colour, drawn ON TOP of the (always-WHITE) geometry rather
+        # than recolouring it -- see the note on self.element_colors
+        # for why the geometry's own draw colour never changes
+        for (kind, idx), colour in self.element_colors.items():
+            center = self._center_point_for(kind, idx)
+            if center is None:
+                continue
+            try:
+                mx, my = self._project(center[0], center[1], center[2], scale, ox, oy)
+                r = 5
+                self._fill_rect(fb, int(mx) - r, int(my) - r, r * 2, r * 2, colour)
+            except Exception as e:
+                ulog("Model3DPage: colour marker draw error: " + type(e).__name__ + " " + str(e))
 
     def _draw_circle_snap_preview(self, fb, scale, ox, oy):
         # live preview for CIRCLE's click-to-place centre step -- a
@@ -5052,6 +6318,15 @@ class Model3DPage(Page):
         self._clipped_line(fb, mx, my - r, mx, my + r, self.CIRCLE_PREVIEW_COLOR)
 
     def _draw_grid_dots(self, fb, scale, ox, oy):
+        # one dot pattern per active grid -- up to one per plane
+        # (XY/XZ/YZ) can be on screen at once, skipping any plane
+        # toggled off individually via the GRID dialog's VISIBLE button
+        for plane, cfg in self.grids.items():
+            if not self.grid_plane_visible.get(plane, True):
+                continue
+            self._draw_one_grid_dots(fb, scale, ox, oy, plane, cfg)
+
+    def _draw_one_grid_dots(self, fb, scale, ox, oy, plane, cfg):
         # a dot at every grid intersection in its plane -- a visible
         # reference to eyeball/eventually snap to, not full grid lines
         # (much cheaper to draw and less visually busy against the
@@ -5065,7 +6340,7 @@ class Model3DPage(Page):
         # a "vertical" XZ grid's Y), so it can line up with an actual
         # wall instead of sitting at 0. extent_i/extent_j are
         # independent, so a grid can exactly cover a non-square face.
-        plane, spacing, extent_i, extent_j, position = self.grid
+        spacing, extent_i, extent_j, position = cfg
         i, j = self.PLANE_AXES[plane]
         k = self._plane_normal_axis(plane)
         ni = int(extent_i / spacing)
@@ -5242,13 +6517,14 @@ class Model3DPage(Page):
             self.g.stop()
         except Exception:
             pass
+        hdmi.fill(hdmi.fb().colour(PAGE))
         g = pcgui.GUI()
         self.g = g
         g.start()
         self.build(g)
 
     def _build_saveas_dialog(self, g):
-        h = 330
+        h = 270
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "SAVE AS", fg=WHITE, font=2)
         g.caption(self.DLG_X + 20, y0 + 40, "Name:", fg=WHITE, bg=self.BLACK, font=1)
@@ -5256,14 +6532,11 @@ class Model3DPage(Page):
                                      self.model_name, font=1)
 
         # EXPORT STL below reuses this same name field -- solidifies
-        # LINE/CIRCLE/ARC edges into struts of this thickness (BOX
-        # elements are already solid, unaffected). See the STL export
-        # module comment near write_stl_file for what this can't do
-        # (it's not a slicer -- load the .stl into one for G-code).
-        g.caption(self.DLG_X + 20, y0 + 100, "STL strut thickness (mm):", fg=WHITE, bg=self.BLACK, font=1)
-        self.stl_thickness_box = g.textbox(self.DLG_X + 20, y0 + 118, self.DLG_W - 40, 26,
-                                            str(self.stl_strut_thickness), font=1)
-
+        # LINE/CIRCLE/ARC edges into struts of a fixed thickness (BOX
+        # elements are already solid, unaffected; see
+        # self.stl_strut_thickness). See the STL export module comment
+        # near write_stl_file for what this can't do (it's not a
+        # slicer -- load the .stl into one for G-code).
         g.button(self.DLG_X + 20, y0 + h - 160, 120, 40, "SAVE", fg=WHITE, bg=BTN, font=2,
                  callback=self.on_confirm_saveas)
         g.button(self.DLG_X + 180, y0 + h - 160, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
@@ -5304,12 +6577,13 @@ class Model3DPage(Page):
 
     def _grid_snap_title_suffix(self):
         # every typed X/Y/Z/radius/angle value across every dialog
-        # snaps to this once a GRID is set (see _snap_to_grid) -- shown
-        # in each dialog's own title bar since there's no spare row for
-        # a separate caption in most of them
-        if not self.grid:
+        # snaps to the CURRENT grid once one is set (see _snap_to_grid)
+        # -- shown in each dialog's own title bar since there's no
+        # spare row for a separate caption in most of them
+        current = self.grids.get(self.grid_current_plane)
+        if not current:
             return " (no grid snap)"
-        return " (snap: %gmm)" % self.grid[1]
+        return " (snap: %gmm, %s)" % (current[0], self.grid_current_plane)
 
     def _build_line_dialog(self, g):
         # two-step: START POINT then END POINT, using the same three
@@ -5426,21 +6700,44 @@ class Model3DPage(Page):
     MULTILINE_MAX_POINTS = 30
 
     def _build_multiline_dialog(self, g):
-        h = 200
+        h = 220
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "MULTI LINE" + self._grid_snap_title_suffix(), fg=WHITE, font=2)
 
         g.caption(self.DLG_X + 20, y0 + 50, "Number of points (3-%d):" % self.MULTILINE_MAX_POINTS,
                   fg=WHITE, bg=self.BLACK, font=1)
         self.multiline_count_box = g.textbox(self.DLG_X + 20, y0 + 70, 100, 26, "5", font=1)
-        g.caption(self.DLG_X + 20, y0 + 106,
-                  "Click each point in the VIEW panel in order --", fg=WHITE, bg=self.BLACK, font=1)
-        g.caption(self.DLG_X + 20, y0 + 124,
-                  "the last one connects back to the first.", fg=WHITE, bg=self.BLACK, font=1)
 
-        g.button(self.DLG_X + 20, y0 + h - 50, 120, 40, "START", fg=WHITE, bg=BTN, font=2,
-                 callback=self.on_confirm_multiline_count)
-        g.button(self.DLG_X + 180, y0 + h - 50, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+        g.button(self.DLG_X + 20, y0 + h - 100, 130, 36, "CLICK ON GRID", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_multiline_start_click)
+        g.button(self.DLG_X + 170, y0 + h - 100, 130, 36, "TYPE VALUES", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_multiline_start_type)
+        g.button(self.DLG_X + 20, y0 + h - 50, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_dialog)
+
+    def _build_multiline_type_dialog(self, g):
+        # typed X/Y/Z entry, one point per screen, reusing the same 3
+        # boxes each time (same trick LINE's start/end steps use) --
+        # the last point's CREATE closes the loop into one POLY, same
+        # as the click-based path in _on_multiline_pick_touch
+        h = 240
+        y0 = (480 - h) // 2
+        idx = len(self.multiline_points)
+        title = "MULTI LINE -- POINT %d/%d" % (idx + 1, self.multiline_target)
+        g.frame(self.DLG_X, y0, self.DLG_W, h, title, fg=WHITE, font=2)
+
+        labels = ("X (mm):", "Y (mm):", "Z (mm):")
+        boxes = []
+        for i, label in enumerate(labels):
+            ly = y0 + 40 + i * 44
+            g.caption(self.DLG_X + 20, ly + 6, label, fg=WHITE, bg=self.BLACK, font=1)
+            boxes.append(g.textbox(self.DLG_X + 130, ly, 100, 26, "", font=1))
+        self.multiline_x_box, self.multiline_y_box, self.multiline_z_box = boxes
+
+        label = "CREATE" if idx == self.multiline_target - 1 else "NEXT"
+        g.button(self.DLG_X + 20, y0 + 180, 120, 40, label, fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_multiline_type_confirm)
+        g.button(self.DLG_X + 180, y0 + 180, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
 
     def _build_radius_dialog(self, g):
@@ -5448,8 +6745,13 @@ class Model3DPage(Page):
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "RADIUS", fg=WHITE, font=2)
 
+        if self._radius_amount_pending is not None:
+            amount_str = self._radius_amount_pending
+            self._radius_amount_pending = None
+        else:
+            amount_str = "5"
         g.caption(self.DLG_X + 20, y0 + 50, "Corner radius (mm):", fg=WHITE, bg=self.BLACK, font=1)
-        self.radius_amount_box = g.textbox(self.DLG_X + 20, y0 + 70, 100, 26, "5", font=1)
+        self.radius_amount_box = g.textbox(self.DLG_X + 20, y0 + 70, 100, 26, amount_str, font=1)
         if self._radius_dialog_message:
             g.caption(self.DLG_X + self.DLG_W // 2, y0 + 106, self._radius_dialog_message,
                       fg=RED, bg=self.BLACK, font=1, just="CT")
@@ -5478,18 +6780,45 @@ class Model3DPage(Page):
         g.button(self.DLG_X + 180, y0 + h - 60, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
 
+    GRID_PLANE_ORDER = ("XY", "XZ", "YZ")
+
     def _build_grid_dialog(self, g):
-        h = 348
+        h = 440
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "GRID", fg=WHITE, font=2)
 
-        # pre-fill from the current grid (if any) so re-opening this
-        # dialog to tweak an existing grid doesn't mean retyping every
-        # field from scratch
-        if self.grid:
-            _, cur_spacing, cur_extent_i, cur_extent_j, cur_position = self.grid
+        # one row per plane, always all three (not just the ones with a
+        # grid) -- click a row to select it, whether or not it has a
+        # grid yet. Replaces the old "cycle Plane" button: with up to 3
+        # grids active at once, clicking the one you want beats cycling
+        # blind through all three to find it.
+        items = []
+        for plane in self.GRID_PLANE_ORDER:
+            cfg = self.grids.get(plane)
+            if cfg:
+                spacing, extent_i, extent_j, position = cfg
+                vis = "ON" if self.grid_plane_visible.get(plane, True) else "OFF"
+                items.append("%s  %gmm  %gx%g  pos %g  %s" % (plane, spacing, extent_i, extent_j, position, vis))
+            else:
+                items.append("%s  (no grid)" % plane)
+        start_index = self.GRID_PLANE_ORDER.index(self.grid_plane) if self.grid_plane in self.GRID_PLANE_ORDER else 0
+        self.grid_list = g.listbox(self.DLG_X + 20, y0 + 40, self.DLG_W - 40, 90, items,
+                                    start_index, font=1, callback=self.on_pick_grid_plane)
+
+        g.button(self.DLG_X + 20, y0 + 140, 130, 32, "TOGGLE VISIBLE", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_toggle_grid_plane_visible)
+        g.button(self.DLG_X + 170, y0 + 140, 130, 32, "DELETE THIS GRID", fg=WHITE, bg=RED, font=1,
+                 callback=self.on_delete_grid)
+
+        # pre-fill from the SELECTED plane's own grid if it has one --
+        # otherwise leave every field blank. A made-up "10mm"/"100mm"
+        # default sitting in an empty plane's fields looked like a
+        # grid already existed there when browsing to delete one.
+        existing = self.grids.get(self.grid_plane)
+        if existing:
+            cur_spacing, cur_extent_i, cur_extent_j, cur_position = (str(v) for v in existing)
         else:
-            cur_spacing, cur_extent_i, cur_extent_j, cur_position = 10, 100, 100, 0
+            cur_spacing = cur_extent_i = cur_extent_j = cur_position = ""
 
         # independent per-axis extents, so a grid can exactly cover a
         # non-square face instead of being forced into a square region
@@ -5497,22 +6826,17 @@ class Model3DPage(Page):
         axis_i_name = self.AXIS_NAMES[axis_i]
         axis_j_name = self.AXIS_NAMES[axis_j]
 
-        ly = y0 + 40
+        ly = y0 + 184
         g.caption(self.DLG_X + 20, ly + 6, "Spacing (mm):", fg=WHITE, bg=self.BLACK, font=1)
-        self.grid_spacing_box = g.textbox(self.DLG_X + 160, ly, 100, 26, str(cur_spacing), font=1)
+        self.grid_spacing_box = g.textbox(self.DLG_X + 160, ly, 100, 26, cur_spacing, font=1)
 
         ly += 44
         g.caption(self.DLG_X + 20, ly + 6, "Extent " + axis_i_name + " (mm):", fg=WHITE, bg=self.BLACK, font=1)
-        self.grid_extent_i_box = g.textbox(self.DLG_X + 160, ly, 100, 26, str(cur_extent_i), font=1)
+        self.grid_extent_i_box = g.textbox(self.DLG_X + 160, ly, 100, 26, cur_extent_i, font=1)
 
         ly += 44
         g.caption(self.DLG_X + 20, ly + 6, "Extent " + axis_j_name + " (mm):", fg=WHITE, bg=self.BLACK, font=1)
-        self.grid_extent_j_box = g.textbox(self.DLG_X + 160, ly, 100, 26, str(cur_extent_j), font=1)
-
-        ly += 44
-        g.caption(self.DLG_X + 20, ly + 6, "Plane:", fg=WHITE, bg=self.BLACK, font=1)
-        g.button(self.DLG_X + 160, ly, 100, 26, self.grid_plane, fg=WHITE, bg=BTN, font=1,
-                 callback=self.on_cycle_grid_plane)
+        self.grid_extent_j_box = g.textbox(self.DLG_X + 160, ly, 100, 26, cur_extent_j, font=1)
 
         ly += 44
         # where the grid sits along its plane's normal axis -- e.g. for
@@ -5520,12 +6844,82 @@ class Model3DPage(Page):
         # line up with an actual wall instead of always sitting at 0
         axis_name = self.AXIS_NAMES[self._plane_normal_axis(self.grid_plane)]
         g.caption(self.DLG_X + 20, ly + 6, axis_name + " position (mm):", fg=WHITE, bg=self.BLACK, font=1)
-        self.grid_position_box = g.textbox(self.DLG_X + 160, ly, 100, 26, str(cur_position), font=1)
+        self.grid_position_box = g.textbox(self.DLG_X + 160, ly, 100, 26, cur_position, font=1)
 
+        g.caption(self.DLG_X + 20, y0 + h - 90, "CREATE makes/replaces the SELECTED plane's grid",
+                  fg=WHITE, bg=self.BLACK, font=1)
         g.button(self.DLG_X + 20, y0 + h - 60, 120, 40, "CREATE", fg=WHITE, bg=BTN, font=2,
                  callback=self.on_confirm_grid)
         g.button(self.DLG_X + 180, y0 + h - 60, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
+
+    def _colour_from_toggles(self):
+        return ((0xFF if self.colour_r else 0) << 16) | ((0xFF if self.colour_g else 0) << 8) | (0xFF if self.colour_b else 0)
+
+    def _fill_rect(self, fb, x, y, w, h, colour):
+        # row-by-row via the same clipped-line primitive everything else
+        # draws with, rather than a separate fill routine -- small area
+        # (a colour swatch), fine to do per-row
+        for row in range(h):
+            self._clipped_line(fb, x, y + row, x + w - 1, y + row, colour)
+
+    def _build_colour_dialog(self, g):
+        # 3 independent on/off toggles (R/G/B), not literal slider
+        # widgets -- this app tried sliders once already and dropped
+        # them for reliability reasons (see PAN_NUDGE/DPAD comments),
+        # and 3 binary toggles is also all this display can actually
+        # show distinctly: 8 combinations total, matching its real
+        # colour depth rather than offering a false-precision gradient.
+        # The colour itself is stored separately from the element (see
+        # self.element_colors) and shown as an additive marker, NEVER
+        # passed into the main wireframe draw calls -- see _draw_scene's
+        # own comment for why that specific swap broke geometry
+        # rendering on real hardware.
+        h = 280
+        y0 = (480 - h) // 2
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "COLOUR", fg=WHITE, font=2)
+
+        kind, idx = self.selected if self.selected else (None, None)
+        label = (kind.upper() + " #" + str(idx + 1)) if kind else "?"
+        g.caption(self.DLG_X + 20, y0 + 40, "For: " + label, fg=WHITE, bg=self.BLACK, font=1)
+
+        swatch_x, swatch_y, swatch_w, swatch_h = self.DLG_X + 200, y0 + 36, 100, 40
+        g.frame(swatch_x - 2, swatch_y - 2, swatch_w + 4, swatch_h + 4, "", fg=WHITE, font=1)
+        try:
+            fb = hdmi.fb()
+            self._fill_rect(fb, swatch_x, swatch_y, swatch_w, swatch_h, self._colour_from_toggles())
+        except Exception as e:
+            ulog("Model3DPage: colour swatch draw error: " + type(e).__name__ + " " + str(e))
+
+        ly = y0 + 96
+        for name, attr in (("Red", "colour_r"), ("Green", "colour_g"), ("Blue", "colour_b")):
+            state = "ON" if getattr(self, attr) else "OFF"
+            g.caption(self.DLG_X + 20, ly + 6, name + ":", fg=WHITE, bg=self.BLACK, font=1)
+            g.button(self.DLG_X + 160, ly, 120, 30, state, fg=WHITE, bg=BTN, font=1,
+                     callback=self._make_colour_toggle_handler(attr))
+            ly += 40
+
+        g.button(self.DLG_X + 20, y0 + h - 60, 120, 40, "SET COLOUR", fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_confirm_colour)
+        g.button(self.DLG_X + 180, y0 + h - 60, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_dialog)
+
+    def _make_colour_toggle_handler(self, attr):
+        def handler(b):
+            setattr(self, attr, not getattr(self, attr))
+            self._redraw()
+        return handler
+
+    def on_confirm_colour(self, b):
+        self.dialog = None
+        if self.selected is None:
+            self._redraw()
+            self.status_box.value = "COLOUR: nothing selected"
+            return
+        self._push_undo()
+        self.element_colors[self.selected] = self._colour_from_toggles()
+        self._redraw()
+        self.status_box.value = "COLOUR: set for %s #%d" % (self.selected[0].upper(), self.selected[1] + 1)
 
     def _build_extrude_dialog(self, g):
         # only reachable with something already selected -- see
@@ -5608,7 +7002,7 @@ class Model3DPage(Page):
                  callback=self.on_cancel_dialog)
 
     def _build_layers_dialog(self, g):
-        h = 340
+        h = 430
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "LAYERS", fg=WHITE, font=2)
 
@@ -5632,9 +7026,47 @@ class Model3DPage(Page):
         if self._layers_dialog_message:
             g.caption(self.DLG_X + self.DLG_W // 2, y0 + 258, self._layers_dialog_message,
                        fg=WHITE, bg=self.BLACK, font=1, just="CT")
+
+        # working origin -- lets typed X/Y/Z values (BOX/LINE corners,
+        # ARC centre) be entered relative to a point you pick, instead
+        # of the model's true 0,0,0 -- handy for a layer whose own
+        # geometry is easiest to describe from its own corner rather
+        # than doing the arithmetic back to the model origin by hand.
+        # Doesn't affect click-to-place or move anything already built.
+        ox, oy, oz = self.origin_offset
+        origin_label = "Origin: 0,0,0 (none set)" if self.origin_offset == (0.0, 0.0, 0.0) else \
+            "Origin offset: %g, %g, %g" % (ox, oy, oz)
+        g.caption(self.DLG_X + 20, y0 + 282, origin_label, fg=WHITE, bg=self.BLACK, font=1)
+        g.button(self.DLG_X + 20, y0 + 302, 130, 34, "SET ORIGIN", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_open_set_origin)
+        g.button(self.DLG_X + 170, y0 + 302, 130, 34, "RESTORE ORIGIN", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_restore_origin)
+
         g.button(self.DLG_X + 20, y0 + h - 60, 130, 40, "NEW LAYER", fg=WHITE, bg=BTN, font=1,
                  callback=self.on_new_layer)
         g.button(self.DLG_X + 170, y0 + h - 60, 130, 40, "CLOSE", fg=WHITE, bg=RED, font=2,
+                 callback=self.on_cancel_dialog)
+
+    def _build_set_origin_dialog(self, g):
+        h = 260
+        y0 = (480 - h) // 2
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "SET ORIGIN", fg=WHITE, font=2)
+        g.caption(self.DLG_X + self.DLG_W // 2, y0 + 36,
+                  "Point that typed 0,0,0 should mean", fg=WHITE, bg=self.BLACK, font=1, just="CT")
+
+        ox, oy, oz = self.origin_offset
+        labels = ("X (mm):", "Y (mm):", "Z (mm):")
+        values = (ox, oy, oz)
+        boxes = []
+        for i, label in enumerate(labels):
+            ly = y0 + 66 + i * 44
+            g.caption(self.DLG_X + 20, ly + 6, label, fg=WHITE, bg=self.BLACK, font=1)
+            boxes.append(g.textbox(self.DLG_X + 160, ly, 100, 26, str(values[i]), font=1))
+        self.origin_x_box, self.origin_y_box, self.origin_z_box = boxes
+
+        g.button(self.DLG_X + 20, y0 + h - 60, 120, 40, "SET", fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_confirm_set_origin)
+        g.button(self.DLG_X + 180, y0 + h - 60, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
                  callback=self.on_cancel_dialog)
 
     def _build_file_list_dialog(self, g, title, action_label, action_callback):
@@ -5869,8 +7301,7 @@ class Model3DPage(Page):
 
     def _stash_template_new_fields(self):
         # preserves whatever's currently typed across the redraw a
-        # toggle button triggers -- same problem/fix as GRID's own
-        # plane-cycle button (see on_cycle_grid_plane)
+        # toggle button triggers
         self._template_new_pending = (
             self.template_new_name_box.value, self.template_new_size_box.value,
             self.template_new_spacing_box.value, self.template_new_scale_box.value)
@@ -5919,12 +7350,17 @@ class Model3DPage(Page):
         self.circles = []
         self.arcs = []
         self.polys = []
-        self.grid = None
+        self.element_colors = {}
+        self.grids = {}
+        self.grid_plane_visible = {}
+        self.grid_current_plane = None
+        self.origin_offset = (0.0, 0.0, 0.0)
         self.layers = ["Layer1"]
         self.current_layer = "Layer1"
         self.layer_visible = {"Layer1": True}
         self.selected = None
         self.dialog = None
+        self.dirty = False
         self._redraw()
         self.status_box.value = "NEW FILE: blank canvas"
 
@@ -5938,9 +7374,10 @@ class Model3DPage(Page):
         self.model_name = name
         try:
             path = save_model_file(name, self.boxes, self.lines, self.circles, self.arcs, self.polys,
-                                    self.grid, self.layers, self.layer_visible)
+                                    self.grids, self.layers, self.layer_visible)
             self.last_model_path = path
             self.last_model_name = name + ".model"
+            self.dirty = False
             self.status_box.value = "Saved to " + path
         except Exception as e:
             self.status_box.value = "SAVE AS failed: " + type(e).__name__ + " " + str(e)
@@ -5951,10 +7388,20 @@ class Model3DPage(Page):
         # (matching the on-screen view) -- never GRID or the template
         # wireframes, both explicitly not part of the real model
         triangles = []
-        for c0, c1, layer in self.boxes:
+        wall_holes, hole_idxs = _find_wall_hole_pairs(self.boxes)
+        for idx, (c0, c1, layer) in enumerate(self.boxes):
             if not self.layer_visible.get(layer, True):
                 continue
-            triangles.extend(_box_triangles(c0, c1))
+            if idx in hole_idxs:
+                # this box IS a hole embedded in another wall (see
+                # _find_wall_hole_pairs) -- represented as a cut in
+                # that wall below, not as its own solid material
+                continue
+            if idx in wall_holes:
+                for p0, p1 in _wall_with_holes_pieces(c0, c1, wall_holes[idx]):
+                    triangles.extend(_box_triangles(p0, p1))
+            else:
+                triangles.extend(_box_triangles(c0, c1))
         for p0, p1, layer in self.lines:
             if not self.layer_visible.get(layer, True):
                 continue
@@ -5992,20 +7439,13 @@ class Model3DPage(Page):
 
     def on_confirm_export_stl(self, b):
         name = (self.saveas_box.value or "").strip()
-        try:
-            thickness = float(self.stl_thickness_box.value)
-            if thickness <= 0:
-                thickness = 4.0
-        except (ValueError, TypeError):
-            thickness = 4.0
-        self.stl_strut_thickness = thickness
         self.dialog = None
         self._redraw()
         if not name:
             self.status_box.value = "EXPORT STL cancelled -- no name entered"
             return
         try:
-            triangles = self._model_to_stl_triangles(thickness / 2.0)
+            triangles = self._model_to_stl_triangles(self.stl_strut_thickness / 2.0)
             if not triangles:
                 self.status_box.value = "EXPORT STL: nothing visible to export"
                 return
@@ -6072,19 +7512,28 @@ class Model3DPage(Page):
             self.status_box.value = "OPEN: nothing selected"
             return
         try:
-            boxes, lines, circles, arcs, polys, grid, layers, layer_visible = load_model_file(name)
+            boxes, lines, circles, arcs, polys, grids, layers, layer_visible = load_model_file(name)
             self._push_undo()
             self.boxes = boxes
             self.lines = lines
             self.circles = circles
             self.arcs = arcs
             self.polys = polys
-            self.grid = grid
+            # colours aren't saved to .model files (session-only for now,
+            # to avoid touching the file format again) -- a freshly
+            # loaded file's indices wouldn't match the old colour
+            # assignments anyway
+            self.element_colors = {}
+            self.grids = grids
+            self.grid_plane_visible = {}
+            self.grid_current_plane = next(iter(grids), None)
+            self.origin_offset = (0.0, 0.0, 0.0)
             self.layers = layers
             self.layer_visible = layer_visible
             self.current_layer = layers[0]
             self.selected = None
             self.model_name = name
+            self.dirty = False
             self._redraw()
             self.status_box.value = "Opened " + name
         except Exception as e:
@@ -6104,6 +7553,10 @@ class Model3DPage(Page):
         else:
             self.status_box.value = "DELETE failed for " + name
 
+    def _apply_origin_offset(self, x, y, z):
+        ox, oy, oz = self.origin_offset
+        return (x + ox, y + oy, z + oz)
+
     def _read_line_point(self):
         def parse(box):
             try:
@@ -6111,7 +7564,7 @@ class Model3DPage(Page):
             except (ValueError, TypeError):
                 v = 0.0
             return self._snap_to_grid(v)
-        return (parse(self.line_x_box), parse(self.line_y_box), parse(self.line_z_box))
+        return self._apply_origin_offset(parse(self.line_x_box), parse(self.line_y_box), parse(self.line_z_box))
 
     def on_line_choice_click(self, b):
         self.line_stage = "start"
@@ -6128,51 +7581,134 @@ class Model3DPage(Page):
         self.dialog = "box_pick"
         self._redraw()
 
-    def on_confirm_multiline_count(self, b):
+    def _read_multiline_count(self):
         try:
             n = int(float(self.multiline_count_box.value))
         except (ValueError, TypeError):
             n = 5
-        n = max(3, min(self.MULTILINE_MAX_POINTS, n))
-        self.multiline_target = n
+        return max(3, min(self.MULTILINE_MAX_POINTS, n))
+
+    def on_multiline_start_click(self, b):
+        self.multiline_target = self._read_multiline_count()
         self.multiline_points = []
         self.dialog = "multiline_pick"
         self._redraw()
+
+    def on_multiline_start_type(self, b):
+        self.multiline_target = self._read_multiline_count()
+        self.multiline_points = []
+        self.dialog = "multiline_type"
+        self._redraw()
+
+    def _infer_multiline_plane(self, points):
+        # typed points have no click/grid to derive a plane from the
+        # way _plane_point_at does for the click-based path -- infer it
+        # from whichever axis came out constant across every point
+        # instead (a real MULTI LINE shape is planar by definition).
+        # Falls back to XY if it isn't flat on any single axis (e.g. a
+        # typo), same as EXTRUDE falling back to Z for a similarly
+        # ambiguous box.
+        for axis, plane in ((2, "XY"), (1, "XZ"), (0, "YZ")):
+            if len(set(round(p[axis], 6) for p in points)) == 1:
+                return plane
+        return "XY"
+
+    def on_multiline_type_confirm(self, b):
+        def parse(box):
+            try:
+                v = float(box.value)
+            except (ValueError, TypeError):
+                v = 0.0
+            return self._snap_to_grid(v)
+        point = self._apply_origin_offset(parse(self.multiline_x_box), parse(self.multiline_y_box),
+                                           parse(self.multiline_z_box))
+        self.multiline_points.append(point)
+        if len(self.multiline_points) < self.multiline_target:
+            self._redraw()
+            return
+        self._push_undo()
+        plane = self._infer_multiline_plane(self.multiline_points)
+        self.polys.append((list(self.multiline_points), plane, 0.0, self.current_layer))
+        count = len(self.multiline_points)
+        self.multiline_points = []
+        self.dialog = None
+        self._redraw()
+        self.status_box.value = ("MULTI LINE: %d-point shape added (closed, %s plane) -- "
+                                  "SELECT + EXTRUDE to make it solid" % (count, plane))
 
     def on_confirm_radius(self, b):
         try:
             radius = float(self.radius_amount_box.value)
         except (ValueError, TypeError):
             radius = 0.0
-        idx_a, idx_b = self.radius_pick_a, self.radius_pick_b
-        single_box = idx_a == idx_b
+        pick_a, pick_b = self.radius_pick_a, self.radius_pick_b
+        single_shape = pick_a == pick_b
         try:
-            box_a = self.boxes[idx_a]
-            box_b = box_a if single_box else self.boxes[idx_b]
+            kind_a, idx_a = pick_a
+            if single_shape:
+                box_a = self.boxes[idx_a] if kind_a == "box" else None
+                poly_a = self.polys[idx_a] if kind_a == "poly" else None
+            else:
+                kind_b, idx_b = pick_b
+                box_a = self.boxes[idx_a]
+                box_b = self.boxes[idx_b]
         except (IndexError, TypeError):
             self.dialog = None
             self.radius_pick_a = None
             self.radius_pick_b = None
             self._redraw()
-            self.status_box.value = "RADIUS: one of those walls no longer exists"
+            self.status_box.value = "RADIUS: one of those shapes no longer exists"
             return
         try:
-            if single_box:
+            if single_shape:
                 x_side, y_side = self.radius_corner_side
-                new_a, pie_points, height = _box_corner_pie((box_a[0], box_a[1]), x_side, y_side, radius)
-                new_b = None
+                if kind_a == "box":
+                    poly_points, height = _box_corner_pie((box_a[0], box_a[1]), x_side, y_side, radius)
+                else:
+                    points, plane, height, layer = poly_a
+                    poly_points = _round_rect_corner(points, x_side, y_side, radius)
             else:
                 new_a, new_b, pie_points, height = _wall_radius_pie(
                     (box_a[0], box_a[1]), (box_b[0], box_b[1]), radius)
         except ValueError as e:
+            self._radius_amount_pending = self.radius_amount_box.value
             self._radius_dialog_message = str(e)
             self._redraw()
             return
-        self._push_undo()
-        self.boxes[idx_a] = (new_a[0], new_a[1], box_a[2])
-        if not single_box:
-            self.boxes[idx_b] = (new_b[0], new_b[1], box_b[2])
-        self.polys.append((pie_points, "XY", height, box_a[2]))
+        except Exception as e:
+            # anything OTHER than the expected "radius doesn't fit"
+            # case -- surfaced here instead of just being swallowed by
+            # pcgui's button-callback wrapper (it only sys.print_exception
+            # to whatever console happens to be attached, easy to miss)
+            self._radius_amount_pending = self.radius_amount_box.value
+            self._radius_dialog_message = type(e).__name__ + ": " + str(e)
+            ulog("Model3DPage RADIUS create error: " + type(e).__name__ + " " + str(e))
+            self._redraw()
+            return
+        try:
+            self._push_undo()
+            if single_shape:
+                if kind_a == "box":
+                    # rounding a box's own corner for the first time
+                    # replaces the box entirely with one rounded-rectangle
+                    # POLY (see _box_corner_pie) -- not a resize plus a
+                    # second box
+                    del self.boxes[idx_a]
+                    self._reindex_colors_after_delete("box", idx_a)
+                    self.polys.append((poly_points, "XY", height, box_a[2]))
+                else:
+                    # rounding ANOTHER corner of an already-rounded shape
+                    # just updates its existing poly in place
+                    self.polys[idx_a] = (poly_points, plane, height, layer)
+            else:
+                self.boxes[idx_a] = (new_a[0], new_a[1], box_a[2])
+                self.boxes[idx_b] = (new_b[0], new_b[1], box_b[2])
+                self.polys.append((pie_points, "XY", height, box_a[2]))
+        except Exception as e:
+            self._radius_dialog_message = type(e).__name__ + ": " + str(e)
+            ulog("Model3DPage RADIUS commit error: " + type(e).__name__ + " " + str(e))
+            self._redraw()
+            return
         self.radius_pick_a = None
         self.radius_pick_b = None
         self.radius_corner_side = None
@@ -6208,7 +7744,7 @@ class Model3DPage(Page):
             except (ValueError, TypeError):
                 v = 0.0
             return self._snap_to_grid(v)
-        return (parse(self.box_x_box), parse(self.box_y_box), parse(self.box_z_box))
+        return self._apply_origin_offset(parse(self.box_x_box), parse(self.box_y_box), parse(self.box_z_box))
 
     def on_box_next(self, b):
         self.box_start_point = self._read_box_point()
@@ -6287,9 +7823,8 @@ class Model3DPage(Page):
             except (ValueError, TypeError):
                 v = fallback
             return self._snap_to_grid(v)
-        cx = parse(self.arc_cx_box, 0.0)
-        cy = parse(self.arc_cy_box, 0.0)
-        cz = parse(self.arc_cz_box, 0.0)
+        cx, cy, cz = self._apply_origin_offset(parse(self.arc_cx_box, 0.0), parse(self.arc_cy_box, 0.0),
+                                                parse(self.arc_cz_box, 0.0))
         r = parse(self.arc_r_box, 20.0)
         if r <= 0:
             r = 20.0
@@ -6302,9 +7837,30 @@ class Model3DPage(Page):
         self._redraw()
         self.status_box.value = "ARC: centre (%g,%g,%g) r=%g %s %g to %g deg" % (cx, cy, cz, r, self.arc_plane, a0, a1)
 
-    def on_cycle_grid_plane(self, b):
-        order = ("XY", "XZ", "YZ")
-        self.grid_plane = order[(order.index(self.grid_plane) + 1) % 3]
+    def on_pick_grid_plane(self, c):
+        i = c.value
+        if 0 <= i < len(self.GRID_PLANE_ORDER):
+            self.grid_plane = self.GRID_PLANE_ORDER[i]
+            self._redraw()
+
+    def on_toggle_grid_plane_visible(self, b):
+        plane = self.grid_plane
+        self.grid_plane_visible[plane] = not self.grid_plane_visible.get(plane, True)
+        self._redraw()
+
+    def on_delete_grid(self, b):
+        plane = self.grid_plane
+        if plane not in self.grids:
+            self._redraw()
+            return
+        self._push_undo()
+        del self.grids[plane]
+        self.grid_plane_visible.pop(plane, None)
+        if self.grid_current_plane == plane:
+            # snapping needs a still-existing grid to reference -- fall
+            # back to any other remaining one, or None if that was the
+            # last grid (matches how it starts before any GRID exists)
+            self.grid_current_plane = next(iter(self.grids), None)
         self._redraw()
 
     def on_cycle_centerline_axis(self, b):
@@ -6315,13 +7871,18 @@ class Model3DPage(Page):
     def _snap_to_grid(self, value):
         # rounds any typed number (not a click position -- see
         # _snap_to_grid_point for that) to the nearest multiple of the
-        # current GRID's spacing, if any -- applied to every numeric
+        # CURRENT grid's spacing, if any -- applied to every numeric
         # field across every typed-entry dialog (BOX/LINE points,
         # CIRCLE/ARC centres and radius, ARC's angles, CTR LINE's
-        # length), not just positions
-        if not self.grid or not self.snap_enabled:
+        # length), not just positions. A typed value isn't tied to any
+        # one plane, so with more than one grid active this uses
+        # whichever grid was most recently created/edited
+        # (self.grid_current_plane), not e.g. whichever plane a
+        # different tool happens to be pointed at right now.
+        current = self.grids.get(self.grid_current_plane)
+        if not current or not self.snap_enabled:
             return value
-        spacing = self.grid[1]
+        spacing = current[0]
         if spacing <= 0:
             return value
         return round(value / spacing) * spacing
@@ -6332,7 +7893,10 @@ class Model3DPage(Page):
         # back to one full spacing unit rather than 0 if rounding would
         # otherwise collapse a short length to nothing
         snapped = self._snap_to_grid(length)
-        return snapped if snapped > 0 else (self.grid[1] if self.grid else length)
+        if snapped > 0:
+            return snapped
+        current = self.grids.get(self.grid_current_plane)
+        return current[0] if current else length
 
     def on_confirm_centerline(self, b):
         try:
@@ -6368,8 +7932,9 @@ class Model3DPage(Page):
             position = 0.0
         if self.snap_enabled and spacing > 0:
             # snap to the spacing just typed in this dialog, not
-            # self.grid's (old) spacing -- self.grid isn't updated
-            # until below, so _snap_to_grid would use stale spacing
+            # this plane's existing grid's (old) spacing -- self.grids
+            # isn't updated until below, so _snap_to_grid would use
+            # stale spacing
             position = round(position / spacing) * spacing
         ni = int(extent_i / spacing)
         nj = int(extent_j / spacing)
@@ -6388,7 +7953,8 @@ class Model3DPage(Page):
                                       "use a bigger spacing or smaller extent" % (dot_count, self.GRID_MAX_DOTS))
             return
         self._push_undo()
-        self.grid = (self.grid_plane, spacing, extent_i, extent_j, position)
+        self.grids[self.grid_plane] = (spacing, extent_i, extent_j, position)
+        self.grid_current_plane = self.grid_plane
         self._redraw()
         axis_name = self.AXIS_NAMES[self._plane_normal_axis(self.grid_plane)]
         self.status_box.value = "GRID: %s, %g mm spacing, %gx%g mm extent, %s=%g" % (
@@ -6399,6 +7965,32 @@ class Model3DPage(Page):
         self._layers_dialog_message = ""
         self.dialog = "layers"
         self._redraw()
+
+    def on_open_set_origin(self, b):
+        self.dialog = "set_origin"
+        self._redraw()
+
+    def on_confirm_set_origin(self, b):
+        def parse(box, fallback):
+            try:
+                return float(box.value)
+            except (ValueError, TypeError):
+                return fallback
+        ox, oy, oz = self.origin_offset
+        self.origin_offset = (parse(self.origin_x_box, ox), parse(self.origin_y_box, oy),
+                               parse(self.origin_z_box, oz))
+        self.dialog = None
+        self._redraw()
+        self.status_box.value = "Origin set to %g, %g, %g -- typed 0,0,0 now means this point" % self.origin_offset
+
+    def on_restore_origin(self, b):
+        self.origin_offset = (0.0, 0.0, 0.0)
+        # feedback goes through _layers_dialog_message (rendered by
+        # _build_layers_dialog itself), not self.status_box -- that
+        # widget belongs to _build_main and doesn't exist while a
+        # dialog like LAYERS is showing instead of the main panel
+        self._layers_dialog_message = "Origin restored to 0,0,0 -- nothing already placed was moved"
+        self._redraw_dialog_in_place()
 
     def on_pick_layer(self, c):
         i = c.value
@@ -6506,6 +8098,17 @@ class Model3DPage(Page):
         elif name == "BOX":
             self.box_stage = "start"
             self.box_pick_start = None
+        elif name == "MEASURE":
+            self.measure_start = None
+        elif name == "COLOUR" and self.selected is None:
+            self.status_box.value = "COLOUR: SELECT an item first"
+            return
+        elif name == "COLOUR":
+            kind, idx = self.selected
+            current = self.element_colors.get((kind, idx), 0xFFFFFF)
+            self.colour_r = (current >> 16) & 0xFF >= 128
+            self.colour_g = (current >> 8) & 0xFF >= 128
+            self.colour_b = current & 0xFF >= 128
         elif name == "RADIUS":
             # a stale self.selected from an earlier SELECT would
             # otherwise keep drawing its marker throughout RADIUS's
@@ -6521,11 +8124,11 @@ class Model3DPage(Page):
             # list below once nothing's currently selected
             self._delete_selected()
             return
-        elif name == "GRID" and self.grid:
-            # pre-fill the plane toggle from the actual current grid,
-            # not whatever was last left over from a previous (possibly
-            # cancelled) visit to this dialog
-            self.grid_plane = self.grid[0]
+        elif name == "GRID" and self.grid_current_plane:
+            # pre-fill the plane toggle from whichever grid was most
+            # recently created/edited, not whatever was last left over
+            # from a previous (possibly cancelled) visit to this dialog
+            self.grid_plane = self.grid_current_plane
         elif name == "TEMPLATE":
             self._template_dialog_message = ""
         target = self.COMMAND_DIALOG.get(name)
@@ -6540,12 +8143,29 @@ class Model3DPage(Page):
         self.dialog = target
         self._redraw()
 
+    def _reindex_colors_after_delete(self, kind, deleted_idx):
+        # element_colors is keyed by (kind, idx) -- deleting shifts every
+        # later same-kind index down by one, so those entries need to
+        # move with them or they'd silently start pointing at the wrong
+        # (now-shifted-into-place) element
+        new_colors = {}
+        for (k, i), colour in self.element_colors.items():
+            if k != kind:
+                new_colors[(k, i)] = colour
+            elif i < deleted_idx:
+                new_colors[(k, i)] = colour
+            elif i > deleted_idx:
+                new_colors[(k, i - 1)] = colour
+            # i == deleted_idx: dropped, that element is gone
+        self.element_colors = new_colors
+
     def _delete_selected(self):
         kind, idx = self.selected
         collection = {"box": self.boxes, "line": self.lines,
                       "circle": self.circles, "arc": self.arcs, "poly": self.polys}[kind]
         self._push_undo()
         del collection[idx]
+        self._reindex_colors_after_delete(kind, idx)
         self.selected = None
         self.dialog = None
         self._redraw()
@@ -6559,8 +8179,8 @@ class Model3DPage(Page):
         # `plane` -- a single 2D screen point can't otherwise be turned
         # back into a 3D one. Uses whatever scale/origin the VIEW panel
         # was last drawn with. The third axis is 0 by default, unless
-        # the active GRID is on this same plane and has a non-zero
-        # position, in which case the point lands on the grid instead
+        # `plane` itself has its own active grid with a non-zero
+        # position, in which case the point lands on that grid instead
         # (matching what's actually drawn -- see _draw_grid_dots).
         #
         # Solved generically rather than with a per-plane formula, so
@@ -6571,8 +8191,9 @@ class Model3DPage(Page):
         scale = self._last_scale or 1.0
         ox, oy = self._last_origin
         normal_offset = 0.0
-        if self.grid and self.grid[0] == plane:
-            normal_offset = self.grid[4]  # (plane, spacing, extent_i, extent_j, position)
+        grid_here = self.grids.get(plane)
+        if grid_here:
+            normal_offset = grid_here[3]  # (spacing, extent_i, extent_j, position)
         offset_x = offset_y = 0.0
         if normal_offset:
             k = self._plane_normal_axis(plane)
@@ -6601,10 +8222,11 @@ class Model3DPage(Page):
             p[self._plane_normal_axis(plane)] = normal_offset
         return (p[0], p[1], p[2])
 
-    def _snap_to_grid_point(self, point):
-        if not self.grid or not self.snap_enabled:
+    def _snap_to_grid_point(self, point, plane):
+        grid_here = self.grids.get(plane)
+        if not grid_here or not self.snap_enabled:
             return point
-        plane, spacing, extent_i, extent_j, position = self.grid
+        spacing, extent_i, extent_j, position = grid_here
         i, j = self.PLANE_AXES[plane]
         k = self._plane_normal_axis(plane)
         p = list(point)
@@ -6628,21 +8250,35 @@ class Model3DPage(Page):
         ex, ey = px - cx, py - cy
         return math.sqrt(ex * ex + ey * ey)
 
-    def _nearest_box_corner(self, box, x, y, scale, ox, oy):
-        # which of a box's 4 vertical (full-height) edges a click
-        # landed nearest -- used by RADIUS's single-box corner pick,
-        # same nearest-in-screen-space idea as _hit_test
-        c0, c1 = box[0], box[1]
-        corners = [(c0[0], c0[1]), (c0[0], c1[1]), (c1[0], c0[1]), (c1[0], c1[1])]
+    def _nearest_rect_corner(self, points, z0, z1, x, y, scale, ox, oy):
+        # which of a rect outline's still-ROUNDABLE (not yet arced)
+        # corners a click landed nearest -- used by RADIUS's own-corner
+        # pick, same nearest-in-screen-space idea as _hit_test.
+        # `points` can be a box's plain 4-corner outline or a POLY
+        # that's already had one or more OTHER corners rounded (see
+        # _round_rect_corner) -- only corners that still exist as a
+        # plain vertex are offered, so a click near an already-rounded
+        # corner just falls through to whichever remaining one is
+        # actually nearest. Returns None if every corner's rounded.
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        candidates = []
+        for (cx, cy) in ((x0, y0), (x0, y1), (x1, y0), (x1, y1)):
+            if any(abs(p[0] - cx) < 1e-6 and abs(p[1] - cy) < 1e-6 for p in points):
+                candidates.append((cx, cy))
         best, best_dist = None, None
-        for (cx, cy) in corners:
-            p_bot = self._project(cx, cy, c0[2], scale, ox, oy)
-            p_top = self._project(cx, cy, c1[2], scale, ox, oy)
+        for (cx, cy) in candidates:
+            p_bot = self._project(cx, cy, z0, scale, ox, oy)
+            p_top = self._project(cx, cy, z1, scale, ox, oy)
             d = self._point_to_segment_dist(x, y, p_bot[0], p_bot[1], p_top[0], p_top[1])
             if best_dist is None or d < best_dist:
                 best_dist, best = d, (cx, cy)
-        x_side = "min" if best[0] == c0[0] else "max"
-        y_side = "min" if best[1] == c0[1] else "max"
+        if best is None:
+            return None
+        x_side = "min" if best[0] == x0 else "max"
+        y_side = "min" if best[1] == y0 else "max"
         return x_side, y_side
 
     def _arc_hit_dist(self, x, y, center, radius, plane, a0, a1, scale, ox, oy, segments=32):
@@ -6720,13 +8356,18 @@ class Model3DPage(Page):
         return None
 
     def _plane_point_at(self, x, y):
-        # model-space position under the cursor, assuming it lies on
-        # the active GRID's plane (or XY if there's no grid) and
-        # snapped to that grid if one exists -- shared by the readout
-        # and by actual point-picking (LINE's "CLICK ON GRID" mode)
-        plane = self.grid[0] if self.grid else "XY"
+        # model-space position under the cursor, snapped to a grid if
+        # one applies -- shared by the readout and by actual
+        # point-picking (LINE/BOX "CLICK ON GRID" mode, MEASURE).
+        # A screen click can't itself disambiguate which plane it's
+        # meant for when more than one grid is active (e.g. XY and XZ
+        # both on screen at once), so this resolves to whichever grid
+        # was most recently created/edited -- same "current grid" rule
+        # used for typed-value snapping -- falling back to XY if no
+        # grid has been set up yet.
+        plane = self.grid_current_plane if self.grid_current_plane in self.grids else "XY"
         point = self._screen_to_plane_point(x, y, plane)
-        point = self._snap_to_grid_point(point)
+        point = self._snap_to_grid_point(point, plane)
         return plane, point
 
     def _position_readout(self, x, y):
@@ -6764,6 +8405,9 @@ class Model3DPage(Page):
         if self.dialog == "multiline_pick":
             self._on_multiline_pick_touch(x, y)
             return
+        if self.dialog == "multiline_edit_pick":
+            self._on_multiline_edit_pick_touch(x, y)
+            return
         if self.dialog == "radius_pick_a":
             self._on_radius_pick_a_touch(x, y)
             return
@@ -6772,6 +8416,9 @@ class Model3DPage(Page):
             return
         if self.dialog == "radius_pick_corner":
             self._on_radius_pick_corner_touch(x, y)
+            return
+        if self.dialog == "measure_pick":
+            self._on_measure_pick_touch(x, y)
             return
         #
         # DRAG CAVEAT: panning is reconstructed from on_touch rather
@@ -6848,6 +8495,34 @@ class Model3DPage(Page):
             self.line_stage = "start"
             self._redraw()
             self.status_box.value = "LINE: %s to %s" % (start_point, end_point)
+
+    def _on_measure_pick_touch(self, x, y):
+        # mirrors _on_line_pick_touch -- two clicks, but nothing gets
+        # added to the model: just reports the straight-line distance
+        # between the two points and exits back to no active command
+        if not self._in_canvas(x, y):
+            self.status_box.value = "MEASURE: click (%d,%d) was outside the VIEW panel" % (x, y)
+            return
+        try:
+            plane, point = self._plane_point_at(x, y)
+        except Exception as e:
+            self.status_box.value = "MEASURE pick error: " + type(e).__name__ + " " + str(e)
+            ulog("Model3DPage: measure pick error: " + type(e).__name__ + " " + str(e))
+            return
+        if self.measure_start is None:
+            self.measure_start = point
+            self._redraw()
+            self.status_box.value = "MEASURE: first point set, click the second point"
+        else:
+            dx = point[0] - self.measure_start[0]
+            dy = point[1] - self.measure_start[1]
+            dz = point[2] - self.measure_start[2]
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            start_point = self.measure_start
+            self.dialog = None
+            self.measure_start = None
+            self._redraw()
+            self.status_box.value = "MEASURE: %s to %s = %.2f mm" % (start_point, point, dist)
 
     def _on_box_pick_touch(self, x, y):
         # BOX's "CLICK ON GRID" mode -- mirrors _on_line_pick_touch:
@@ -6933,35 +8608,79 @@ class Model3DPage(Page):
         self.status_box.value = ("MULTI LINE: %d-point shape added (closed) -- "
                                   "SELECT + EXTRUDE to make it solid" % count)
 
+    def _on_multiline_edit_pick_touch(self, x, y):
+        # mirrors _on_multiline_pick_touch, but REPLACES the points of
+        # self.polys[self.multiline_edit_idx] instead of appending a new
+        # poly -- plane/height/layer are untouched, only points change
+        if not self._in_canvas(x, y):
+            self.status_box.value = "EDIT: click (%d,%d) was outside the VIEW panel" % (x, y)
+            return
+        try:
+            plane, point = self._plane_point_at(x, y)
+        except Exception as e:
+            self.status_box.value = "EDIT pick error: " + type(e).__name__ + " " + str(e)
+            ulog("Model3DPage: multiline edit pick error: " + type(e).__name__ + " " + str(e))
+            return
+        self.multiline_points.append(point)
+        if len(self.multiline_points) < self.multiline_target:
+            self._redraw()
+            self.status_box.value = ("EDIT: point %d/%d placed, click next point"
+                                      % (len(self.multiline_points), self.multiline_target))
+            return
+        idx = self.multiline_edit_idx
+        try:
+            _, orig_plane, orig_height, orig_layer = self.polys[idx]
+        except IndexError:
+            self.multiline_points = []
+            self.multiline_edit_idx = None
+            self.dialog = None
+            self._redraw()
+            self.status_box.value = "EDIT: that item no longer exists"
+            return
+        self._push_undo()
+        self.polys[idx] = (list(self.multiline_points), orig_plane, orig_height, orig_layer)
+        count = len(self.multiline_points)
+        self.multiline_points = []
+        self.multiline_edit_idx = None
+        self.dialog = None
+        self._redraw()
+        self.status_box.value = "EDIT: MULTI LINE #%d points replaced (%d points)" % (idx + 1, count)
+
     def _on_radius_pick_a_touch(self, x, y):
         if not self._in_canvas(x, y):
             self.status_box.value = "RADIUS: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
         hit = self._hit_test(x, y)
-        if hit is None or hit[0] != "box":
+        if hit is None or hit[0] not in ("box", "poly"):
             self.status_box.value = "RADIUS: click nearer a BOX wall"
             return
-        self.radius_pick_a = hit[1]
+        self.radius_pick_a = hit  # (kind, idx) -- "poly" lets an already-rounded shape be picked again
         self.dialog = "radius_pick_b"
         self._redraw()
-        self.status_box.value = "RADIUS: first wall picked -- click the SECOND wall"
+        self.status_box.value = "RADIUS: first wall picked -- click the SECOND wall (or the SAME one again)"
 
     def _on_radius_pick_b_touch(self, x, y):
         if not self._in_canvas(x, y):
             self.status_box.value = "RADIUS: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
         hit = self._hit_test(x, y)
-        if hit is None or hit[0] != "box":
+        if hit is None or hit[0] not in ("box", "poly"):
             self.status_box.value = "RADIUS: click nearer a BOX wall"
             return
-        if hit[1] == self.radius_pick_a:
-            # same wall picked twice -- round one of ITS OWN corners
+        if hit == self.radius_pick_a:
+            # same shape picked twice -- round one of ITS OWN corners
             # instead of a corner shared with a second wall
             self.dialog = "radius_pick_corner"
             self._redraw()
-            self.status_box.value = "RADIUS: click near the CORNER of that box to round"
+            self.status_box.value = "RADIUS: click near the CORNER of that shape to round"
             return
-        self.radius_pick_b = hit[1]
+        if hit[0] != "box" or self.radius_pick_a[0] != "box":
+            # a shared-corner rounding needs two DISTINCT BOX walls --
+            # a poly (an already-rounded shape) only supports rounding
+            # its OWN further corners, picked by clicking it twice
+            self.status_box.value = "RADIUS: pick two BOX walls to share a corner, or click the SAME one twice"
+            return
+        self.radius_pick_b = hit
         self.radius_corner_side = None
         self._radius_dialog_message = ""
         self.dialog = "radius"
@@ -6971,17 +8690,31 @@ class Model3DPage(Page):
         if not self._in_canvas(x, y):
             self.status_box.value = "RADIUS: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
+        kind, idx = self.radius_pick_a
         try:
-            box = self.boxes[self.radius_pick_a]
+            if kind == "box":
+                (x0, y0, z0), (x1, y1, z1) = self.boxes[idx][0], self.boxes[idx][1]
+                points = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0)]
+            else:
+                points = self.polys[idx][0]
+                height = self.polys[idx][2]
+                z0, z1 = points[0][2], points[0][2] + height
         except IndexError:
             self.dialog = None
             self.radius_pick_a = None
             self._redraw()
-            self.status_box.value = "RADIUS: that box no longer exists"
+            self.status_box.value = "RADIUS: that shape no longer exists"
             return
         self.radius_pick_b = self.radius_pick_a
-        self.radius_corner_side = self._nearest_box_corner(
-            box, x, y, self._last_scale, self._last_origin[0], self._last_origin[1])
+        self.radius_corner_side = self._nearest_rect_corner(
+            points, z0, z1, x, y, self._last_scale, self._last_origin[0], self._last_origin[1])
+        if self.radius_corner_side is None:
+            self.dialog = None
+            self.radius_pick_a = None
+            self.radius_pick_b = None
+            self._redraw()
+            self.status_box.value = "RADIUS: every corner of that shape is already rounded"
+            return
         self._radius_dialog_message = ""
         self.dialog = "radius"
         self._redraw()
@@ -7106,8 +8839,23 @@ class Model3DPage(Page):
             self.lines.append((p1, top1, layer))
             self.status_box.value = "EXTRUDE: line raised into a %gmm wall" % amount
         elif kind == "box":
-            self.boxes[idx] = (c0, (c1[0], c1[1], c1[2] + amount), layer)
-            self.status_box.value = "EXTRUDE: box height increased by %gmm" % amount
+            # grow whichever axis the box is actually flat (zero-extent)
+            # on, not always Z -- a box built via CLICK ON GRID on the
+            # XZ or YZ plane is flat in Y or X respectively (both
+            # corners share that coordinate), so always growing Z (the
+            # old behaviour) silently did nothing visible for anything
+            # but an XY-plane (floor-style) box
+            axis = None
+            for i in range(3):
+                if c1[i] - c0[i] == 0:
+                    axis = i
+                    break
+            if axis is None:
+                axis = 2  # already has volume on every axis -- match old behaviour
+            c1_grown = list(c1)
+            c1_grown[axis] += amount
+            self.boxes[idx] = (c0, tuple(c1_grown), layer)
+            self.status_box.value = "EXTRUDE: box grown %gmm along %s" % (amount, self.AXIS_NAMES[axis])
         elif kind == "circle":
             # sweeps the circle along its plane's normal axis into a
             # cylinder outline: the original stays as the bottom
@@ -7154,10 +8902,26 @@ class Model3DPage(Page):
             return
         if self.selected[0] == "poly":
             # arbitrary point count doesn't fit the generic fixed-field
-            # EDIT dialog every other kind uses -- DELETE and redraw is
-            # the only way to change a MULTI LINE shape's points for
-            # now; EXTRUDE still works fine on it for changing height
-            self.status_box.value = "EDIT: not supported for MULTI LINE shapes yet -- DELETE and redraw, or EXTRUDE to change height"
+            # EDIT dialog every other kind uses -- instead, re-click the
+            # same number of points (in order) to reposition them, same
+            # click-by-click flow MULTI LINE creation itself uses, just
+            # replacing this poly's points in place instead of adding a
+            # new one. Plane/height/layer are left exactly as they were;
+            # only the points themselves change.
+            idx = self.selected[1]
+            try:
+                points, plane, height, layer = self.polys[idx]
+            except IndexError:
+                self.status_box.value = "EDIT: that item no longer exists"
+                return
+            self.multiline_edit_idx = idx
+            self.multiline_target = len(points)
+            self.multiline_points = []
+            self.active_command = "EDIT"
+            self.dialog = "multiline_edit_pick"
+            self._redraw()
+            self.status_box.value = ("EDIT: click %d point(s) in order to replace this shape's points "
+                                      "(1/%d)" % (self.multiline_target, self.multiline_target))
             return
         self.active_command = "EDIT"
         self.dialog = "edit"
@@ -7220,12 +8984,17 @@ class Model3DPage(Page):
         self._redraw()
 
     def _model_snapshot(self):
+        # self.grids is a mutable dict now (not a single immutable tuple
+        # like the old self.grid) -- must be copied here, same as
+        # layer_visible already is, or a later GRID edit would silently
+        # mutate this "saved" snapshot too since it'd be the same object
         return (list(self.boxes), list(self.lines), list(self.circles), list(self.arcs), list(self.polys),
-                self.grid, list(self.layers), dict(self.layer_visible), self.current_layer)
+                dict(self.grids), list(self.layers), dict(self.layer_visible), self.current_layer,
+                dict(self.element_colors))
 
     def _restore_snapshot(self, snapshot):
-        (self.boxes, self.lines, self.circles, self.arcs, self.polys, self.grid,
-         self.layers, self.layer_visible, self.current_layer) = snapshot
+        (self.boxes, self.lines, self.circles, self.arcs, self.polys, self.grids,
+         self.layers, self.layer_visible, self.current_layer, self.element_colors) = snapshot
 
     def _push_undo(self):
         # call BEFORE mutating the model -- captures the state to go
@@ -7235,6 +9004,7 @@ class Model3DPage(Page):
         if len(self.undo_stack) > self.UNDO_MAX:
             self.undo_stack.pop(0)
         self.redo_stack = []
+        self.dirty = True
 
     def on_undo(self, b):
         if not self.undo_stack:
@@ -7292,10 +9062,53 @@ class Model3DPage(Page):
                 yi += step
 
     def on_back(self, b):
+        if self.dirty:
+            self.dialog = "confirm_exit"
+            self._redraw()
+            return
+        self.go("menu")
+
+    def _build_confirm_exit_dialog(self, g):
+        h = 180
+        y0 = (480 - h) // 2
+        g.frame(self.DLG_X, y0, self.DLG_W, h, "UNSAVED CHANGES", fg=WHITE, font=2)
+        g.caption(self.DLG_X + self.DLG_W // 2, y0 + 40, "Save changes before leaving?",
+                  fg=WHITE, bg=self.BLACK, font=1, just="CT")
+        g.button(self.DLG_X + 20, y0 + 70, 120, 44, "SAVE", fg=WHITE, bg=BTN, font=1,
+                 callback=self.on_confirm_exit_save)
+        g.button(self.DLG_X + 180, y0 + 70, 120, 44, "DON'T SAVE", fg=WHITE, bg=RED, font=1,
+                 callback=self.on_confirm_exit_discard)
+        g.button(self.DLG_X + 100, y0 + 126, 120, 40, "CANCEL", fg=WHITE, bg=BTN, font=2,
+                 callback=self.on_cancel_dialog)
+
+    def on_confirm_exit_save(self, b):
+        # quick-saves under whatever name is already active (same
+        # default SAVE AS's own textbox pre-fills with) rather than
+        # detouring through the full SAVE AS dialog -- STL export/
+        # strut thickness aren't relevant to "don't lose my edits"
+        try:
+            path = save_model_file(self.model_name, self.boxes, self.lines, self.circles, self.arcs,
+                                    self.polys, self.grids, self.layers, self.layer_visible)
+            self.last_model_path = path
+            self.last_model_name = self.model_name + ".model"
+            self.dirty = False
+        except Exception as e:
+            self.dialog = None
+            self._redraw()
+            self.status_box.value = "Save failed: " + type(e).__name__ + " " + str(e) + " -- not leaving"
+            ulog("Model3DPage exit-save error: " + type(e).__name__ + " " + str(e))
+            return
+        self.dialog = None
+        self.go("menu")
+
+    def on_confirm_exit_discard(self, b):
+        self.dialog = None
+        self.dirty = False
         self.go("menu")
 
 
 class SDImportPage(Page):
+    PAGE_LABEL = "IMPORT SD"
     # a navigable file browser -- start at /sd, click into folders,
     # click ".." to go up, pick ANY file anywhere on the card. Photos
     # (.jpg/.jpeg/.bmp) copy into PHOTO_DIR ready to attach to a
@@ -7647,10 +9460,12 @@ class GamesPage(Page):
     # exec() in a fresh namespace is the only way to "run another
     # program and come back"). This is genuinely risky: a game that
     # changes hdmi mode or leaves hardware in a strange state could
-    # destabilise the board (see the RGB1024-causes-a-hard-reset note
-    # elsewhere in this file) -- on_run tries to force the display back
-    # to a known-good state afterward regardless of how the game exits,
-    # but that's a best-effort safety net, not a guarantee.
+    # destabilise the board (switching to hdmi.RGB1024 to decode a large
+    # image was what used to hard-reset the board in the old picture
+    # preview, before show_picture_boxed stopped doing that) -- on_run
+    # tries to force the display back to a known-good state afterward
+    # regardless of how the game exits, but that's a best-effort safety
+    # net, not a guarantee.
     def build(self, g):
         g.caption(320, 6, "Games", fg=INK, bg=PAGE, font=3, just="CT")
         self.list = None
@@ -7943,6 +9758,10 @@ class ExportPage(Page):
 
 
 class Members(Page):
+    def __init__(self, preload=0):
+        Page.__init__(self)
+        self._preload = preload
+
     def build(self, g):
         self.num = 0
         self.found = []
@@ -7993,7 +9812,14 @@ class Members(Page):
 
     def enter(self):
         self.refresh("")
-        self.say(str(member_count()) + " members -- type a name, number or rego")
+        if self._preload:
+            # coming back from PHOTO/CARS/EMAIL for this member -- reload
+            # them straight away instead of leaving the form blank and
+            # making the user search/pick them again just to see whether
+            # e.g. a photo attach actually took
+            self.load(self._preload)
+        else:
+            self.say(str(member_count()) + " members -- type a name, number or rego")
 
     def refresh(self, text):
         self.found = find_members(text)
@@ -8202,6 +10028,8 @@ class Members(Page):
 
 
 class EmailMemberPage(Page):
+    PAGE_LABEL = "EMAIL MEMBER"
+
     def __init__(self, num):
         Page.__init__(self)
         self.num = num
@@ -8622,7 +10450,21 @@ class Events(Page):
         if not photo:
             self.say("No photo attached to this event -- press IMPORT")
             return
-        preview_picture(self, PHOTO_DIR + "/" + photo, photo)
+        saved_key = self.key
+        try:
+            self.g.stop()
+        except Exception:
+            pass
+        show_picture_boxed(PHOTO_DIR + "/" + photo, photo)
+        hdmi.fill(hdmi.fb().colour(PAGE))
+        g = pcgui.GUI()
+        self.g = g
+        g.start()
+        self.build(g)
+        self.refresh()
+        if saved_key:
+            self.load_by_key(saved_key)
+        self.say("Back from preview")
 
     def on_menu(self, b):
         self.go("menu")
@@ -8636,13 +10478,15 @@ def main():
     where = "menu"
     who = 0
     picked_car = 0
+    reload_member = 0
     try:
         while where != "exit":
             try:
                 if where == "menu":
                     where = Menu().show()
                 elif where == "members":
-                    p = Members()
+                    p = Members(reload_member)
+                    reload_member = 0
                     where = p.show()
                     if where == "cars" or where == "photos" or where == "email_member":
                         who = p.pick_member
@@ -8655,14 +10499,18 @@ def main():
                     where = CarPhotosPage(picked_car).show()
                 elif where == "photos":
                     where = MemberPhotosPage(who).show()
+                    reload_member = who
                 elif where == "email_member":
                     where = EmailMemberPage(who).show()
+                    reload_member = who
                 elif where == "events":
                     where = Events().show()
                 elif where == "wifi":
                     where = WifiPage().show()
                 elif where == "genphotos":
                     where = GeneralPhotosPage().show()
+                elif where == "clubcars":
+                    where = ClubCarsPage().show()
                 elif where == "sdimport":
                     where = SDImportPage().show()
                 elif where == "games":
@@ -8671,6 +10519,8 @@ def main():
                     where = Model3DPage().show()
                 elif where == "calculator":
                     where = CalculatorPage().show()
+                elif where == "gps":
+                    where = GPSPage().show()
                 elif where == "export":
                     where = ExportPage().show()
                 elif isinstance(where, str) and where.startswith("help|"):
