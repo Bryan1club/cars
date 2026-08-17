@@ -691,45 +691,102 @@ def _wall_radius_pie(boxA, boxB, radius):
     return (tuple(a0), tuple(a1)), (tuple(b0), tuple(b1)), pie_points, (z1 - z0)
 
 
-def _box_corner_pie(box, x_side, y_side, radius):
-    # rounds ONE box's own corner directly -- x_side/y_side are each
-    # "min" or "max", picking which of its 4 vertical corners. Same
-    # trim-and-fill-with-a-quarter-cylinder idea as _wall_radius_pie,
-    # just without needing a second box to find the corner from.
-    c0, c1 = list(box[0]), list(box[1])
-    x_len, y_len = c1[0] - c0[0], c1[1] - c0[1]
-    if radius <= 0 or radius >= x_len or radius >= y_len:
-        raise ValueError("radius too large for this box")
-    corner_x = c0[0] if x_side == "min" else c1[0]
-    corner_y = c0[1] if y_side == "min" else c1[1]
+def _round_rect_corner(points, x_side, y_side, radius):
+    # rounds ONE corner of a rectangle-derived outline -- x_side/y_side
+    # ("min"/"max" each) identify the target corner by `points`' own
+    # bounding box, same convention _box_corner_pie/_nearest_rect_corner
+    # use. `points` can be a box's plain 4-corner outline (see
+    # _box_corner_pie) OR a POLY that's already had one or more of its
+    # OTHER corners rounded by an earlier RADIUS -- letting RADIUS be
+    # used repeatedly on the same shape (all 4 corners of a plate, say)
+    # instead of only once. A tangent point on either adjacent edge
+    # always sits exactly on that edge's original line, so the target
+    # corner's still-plain vertex is easy to find directly, and the
+    # outline's bounding box keeps identifying the same 4 logical
+    # corners no matter how many of them have already been rounded.
+    # Raises ValueError if that corner isn't a plain (not yet rounded)
+    # vertex in `points`, or the radius doesn't fit either adjacent edge.
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    corner_x = x0 if x_side == "min" else x1
+    corner_y = y0 if y_side == "min" else y1
+    target = None
+    for idx, p in enumerate(points):
+        if abs(p[0] - corner_x) < 1e-6 and abs(p[1] - corner_y) < 1e-6:
+            target = idx
+            break
+    if target is None:
+        raise ValueError("that corner is already rounded")
+    z0v = points[0][2]
+    n = len(points)
+    prev_pt = points[(target - 1) % n]
+    next_pt = points[(target + 1) % n]
+    # math.sqrt, not math.hypot -- this board's MicroPython math module
+    # doesn't implement hypot (see _point_to_segment_dist)
+    edge_prev = math.sqrt((prev_pt[0] - corner_x) ** 2 + (prev_pt[1] - corner_y) ** 2)
+    edge_next = math.sqrt((next_pt[0] - corner_x) ** 2 + (next_pt[1] - corner_y) ** 2)
+    if radius <= 0 or radius >= edge_prev or radius >= edge_next:
+        raise ValueError("radius too large for this corner")
     dir_x = 1.0 if x_side == "min" else -1.0
     dir_y = 1.0 if y_side == "min" else -1.0
-    if x_side == "min":
-        c0[0] += radius
-    else:
-        c1[0] -= radius
-    if y_side == "min":
-        c0[1] += radius
-    else:
-        c1[1] -= radius
-
     center = (corner_x + dir_x * radius, corner_y + dir_y * radius)
-    edge_x_pt = (center[0], corner_y)   # meets the X-trimmed edge, at the untrimmed Y extreme
-    edge_y_pt = (corner_x, center[1])   # meets the Y-trimmed edge, at the untrimmed X extreme
+    edge_x_pt = (center[0], corner_y)   # tangent point on the edge running along X
+    edge_y_pt = (corner_x, center[1])   # tangent point on the edge running along Y
+
+    # walking the outline counter-clockwise, which tangent point is
+    # reached FIRST depends on which corner is being rounded: min/min
+    # and max/max enter via the Y-running edge and leave via the
+    # X-running edge; max/min and min/max are the other way around
+    # (confirmed against a numeric CCW-winding check across all four,
+    # not just one case)
+    if x_side == y_side:
+        enter_pt, leave_pt = edge_y_pt, edge_x_pt
+    else:
+        enter_pt, leave_pt = edge_x_pt, edge_y_pt
 
     def ang(pt):
         return math.degrees(math.atan2(pt[1] - center[1], pt[0] - center[0]))
-    a0deg, a1deg = ang(edge_y_pt), ang(edge_x_pt)
-    delta = (a1deg - a0deg + 180) % 360 - 180
+    a0deg, a1deg = ang(enter_pt), ang(leave_pt)
+    delta = (a1deg - a0deg + 180) % 360 - 180  # shortest signed turn, always the 90deg way
 
-    z0, z1 = box[0][2], box[1][2]
     segs = max(2, int(round(8 * abs(delta) / 90.0)))
-    pie_points = [(center[0], center[1], z0)]
+    arc_pts = []
     for i in range(segs + 1):
         deg = math.radians(a0deg + delta * i / segs)
-        pie_points.append((center[0] + radius * math.cos(deg), center[1] + radius * math.sin(deg), z0))
+        arc_pts.append((center[0] + radius * math.cos(deg), center[1] + radius * math.sin(deg), z0v))
 
-    return (tuple(c0), tuple(c1)), pie_points, (z1 - z0)
+    return points[:target] + arc_pts + points[target + 1:]
+
+
+def _box_corner_pie(box, x_side, y_side, radius):
+    # rounds ONE box's own corner for the FIRST time -- x_side/y_side
+    # are each "min" or "max", picking which of its 4 vertical corners.
+    # Starts from the box's own plain 4-corner outline and hands off to
+    # _round_rect_corner (which also handles rounding a SECOND, third,
+    # or fourth corner of the same shape once it's already a POLY from
+    # an earlier RADIUS -- see that function). Replaces the box
+    # entirely with a SINGLE rounded-rectangle POLY, extruded as one
+    # solid via _poly_solid_triangles -- not split into separate pieces
+    # plus a wedge (an earlier version of this did that, and got the
+    # arc's winding backwards on two of the four corners, producing an
+    # inverted, indented wedge on half of them). A single polygon also
+    # can't develop a seam between pieces, and can't be mistaken for a
+    # hole by the STL export's wall-hole detection the way a small
+    # separate corner piece could.
+    #
+    # Trimming a single box's corner point directly (an even earlier
+    # approach, before either of the above) shrank it across its FULL
+    # width/depth on that axis, not just near the corner, since a box
+    # is one axis-aligned rectangle with no way to represent a local
+    # notch on its own -- fine for a wall (long in one direction, thin
+    # in the other) but visibly wrong for something wide in both X and
+    # Y, like a floor plate.
+    (x0, y0, z0), (x1, y1, z1) = box
+    rect = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0)]
+    poly_points = _round_rect_corner(rect, x_side, y_side, radius)
+    return poly_points, (z1 - z0)
 
 
 STL_DIR = "/sd/stl"
@@ -1152,9 +1209,9 @@ class Model3DPage(Page):
         self.polys = []              # list of (points, plane, extrude_height, layer) -- see MULTI LINE
         self.multiline_points = []   # points placed so far in the current MULTI LINE pick
         self.multiline_target = 0    # how many points MULTI LINE is waiting for
-        self.radius_pick_a = None    # index into self.boxes of RADIUS's first picked wall
-        self.radius_pick_b = None    # index into self.boxes of RADIUS's second picked wall
-        self.radius_corner_side = None  # (x_side, y_side) once a single box's own corner is picked
+        self.radius_pick_a = None    # (kind, idx) -- kind is "box" or "poly" -- of RADIUS's first picked wall
+        self.radius_pick_b = None    # (kind, idx) of RADIUS's second picked wall
+        self.radius_corner_side = None  # (x_side, y_side) once a single shape's own corner is picked
         self._radius_dialog_message = ""
 
         self.line_start_point = None
@@ -2093,7 +2150,7 @@ class Model3DPage(Page):
         self.build(g)
 
     def _build_saveas_dialog(self, g):
-        h = 280
+        h = 220
         y0 = (480 - h) // 2
         g.frame(self.DLG_X, y0, self.DLG_W, h, "SAVE AS", fg=WHITE, font=2)
         g.caption(self.DLG_X + 20, y0 + 40, "Name:", fg=WHITE, bg=self.BLACK, font=1)
@@ -2101,14 +2158,11 @@ class Model3DPage(Page):
                                      self.model_name, font=1)
 
         # EXPORT STL below reuses this same name field -- solidifies
-        # LINE/CIRCLE/ARC edges into struts of this thickness (BOX
-        # elements are already solid, unaffected). See the STL export
-        # module comment near write_stl_file for what this can't do
-        # (it's not a slicer -- load the .stl into one for G-code).
-        g.caption(self.DLG_X + 20, y0 + 100, "STL strut thickness (mm):", fg=WHITE, bg=self.BLACK, font=1)
-        self.stl_thickness_box = g.textbox(self.DLG_X + 20, y0 + 118, self.DLG_W - 40, 26,
-                                            str(self.stl_strut_thickness), font=1)
-
+        # LINE/CIRCLE/ARC edges into struts of a fixed thickness (BOX
+        # elements are already solid, unaffected; see
+        # self.stl_strut_thickness). See the STL export module comment
+        # near write_stl_file for what this can't do (it's not a
+        # slicer -- load the .stl into one for G-code).
         g.button(self.DLG_X + 20, y0 + h - 110, 120, 40, "SAVE", fg=WHITE, bg=BTN, font=2,
                  callback=self.on_confirm_saveas)
         g.button(self.DLG_X + 180, y0 + h - 110, 120, 40, "CANCEL", fg=WHITE, bg=RED, font=2,
@@ -2829,20 +2883,13 @@ class Model3DPage(Page):
 
     def on_confirm_export_stl(self, b):
         name = (self.saveas_box.value or "").strip()
-        try:
-            thickness = float(self.stl_thickness_box.value)
-            if thickness <= 0:
-                thickness = 4.0
-        except (ValueError, TypeError):
-            thickness = 4.0
-        self.stl_strut_thickness = thickness
         self.dialog = None
         self._redraw()
         if not name:
             self.status_box.value = "EXPORT STL cancelled -- no name entered"
             return
         try:
-            triangles = self._model_to_stl_triangles(thickness / 2.0)
+            triangles = self._model_to_stl_triangles(self.stl_strut_thickness / 2.0)
             if not triangles:
                 self.status_box.value = "EXPORT STL: nothing visible to export"
                 return
@@ -2937,23 +2984,32 @@ class Model3DPage(Page):
             radius = float(self.radius_amount_box.value)
         except (ValueError, TypeError):
             radius = 0.0
-        idx_a, idx_b = self.radius_pick_a, self.radius_pick_b
-        single_box = idx_a == idx_b
+        pick_a, pick_b = self.radius_pick_a, self.radius_pick_b
+        single_shape = pick_a == pick_b
         try:
-            box_a = self.boxes[idx_a]
-            box_b = box_a if single_box else self.boxes[idx_b]
+            kind_a, idx_a = pick_a
+            if single_shape:
+                box_a = self.boxes[idx_a] if kind_a == "box" else None
+                poly_a = self.polys[idx_a] if kind_a == "poly" else None
+            else:
+                kind_b, idx_b = pick_b
+                box_a = self.boxes[idx_a]
+                box_b = self.boxes[idx_b]
         except (IndexError, TypeError):
             self.dialog = None
             self.radius_pick_a = None
             self.radius_pick_b = None
             self._redraw()
-            self.status_box.value = "RADIUS: one of those walls no longer exists"
+            self.status_box.value = "RADIUS: one of those shapes no longer exists"
             return
         try:
-            if single_box:
+            if single_shape:
                 x_side, y_side = self.radius_corner_side
-                new_a, pie_points, height = _box_corner_pie((box_a[0], box_a[1]), x_side, y_side, radius)
-                new_b = None
+                if kind_a == "box":
+                    poly_points, height = _box_corner_pie((box_a[0], box_a[1]), x_side, y_side, radius)
+                else:
+                    points, plane, height, layer = poly_a
+                    poly_points = _round_rect_corner(points, x_side, y_side, radius)
             else:
                 new_a, new_b, pie_points, height = _wall_radius_pie(
                     (box_a[0], box_a[1]), (box_b[0], box_b[1]), radius)
@@ -2961,11 +3017,38 @@ class Model3DPage(Page):
             self._radius_dialog_message = str(e)
             self._redraw()
             return
-        self._push_undo()
-        self.boxes[idx_a] = (new_a[0], new_a[1], box_a[2])
-        if not single_box:
-            self.boxes[idx_b] = (new_b[0], new_b[1], box_b[2])
-        self.polys.append((pie_points, "XY", height, box_a[2]))
+        except Exception as e:
+            # anything OTHER than the expected "radius doesn't fit"
+            # case -- surfaced here instead of just being swallowed by
+            # pcgui's button-callback wrapper (it only sys.print_exception
+            # to whatever console happens to be attached, easy to miss)
+            self._radius_dialog_message = type(e).__name__ + ": " + str(e)
+            ulog("Model3DPage RADIUS create error: " + type(e).__name__ + " " + str(e))
+            self._redraw()
+            return
+        try:
+            self._push_undo()
+            if single_shape:
+                if kind_a == "box":
+                    # rounding a box's own corner for the first time
+                    # replaces the box entirely with one rounded-rectangle
+                    # POLY (see _box_corner_pie) -- not a resize plus a
+                    # second box
+                    del self.boxes[idx_a]
+                    self.polys.append((poly_points, "XY", height, box_a[2]))
+                else:
+                    # rounding ANOTHER corner of an already-rounded shape
+                    # just updates its existing poly in place
+                    self.polys[idx_a] = (poly_points, plane, height, layer)
+            else:
+                self.boxes[idx_a] = (new_a[0], new_a[1], box_a[2])
+                self.boxes[idx_b] = (new_b[0], new_b[1], box_b[2])
+                self.polys.append((pie_points, "XY", height, box_a[2]))
+        except Exception as e:
+            self._radius_dialog_message = type(e).__name__ + ": " + str(e)
+            ulog("Model3DPage RADIUS commit error: " + type(e).__name__ + " " + str(e))
+            self._redraw()
+            return
         self.radius_pick_a = None
         self.radius_pick_b = None
         self.radius_corner_side = None
@@ -3417,21 +3500,35 @@ class Model3DPage(Page):
         ex, ey = px - cx, py - cy
         return math.sqrt(ex * ex + ey * ey)
 
-    def _nearest_box_corner(self, box, x, y, scale, ox, oy):
-        # which of a box's 4 vertical (full-height) edges a click
-        # landed nearest -- used by RADIUS's single-box corner pick,
-        # same nearest-in-screen-space idea as _hit_test
-        c0, c1 = box[0], box[1]
-        corners = [(c0[0], c0[1]), (c0[0], c1[1]), (c1[0], c0[1]), (c1[0], c1[1])]
+    def _nearest_rect_corner(self, points, z0, z1, x, y, scale, ox, oy):
+        # which of a rect outline's still-ROUNDABLE (not yet arced)
+        # corners a click landed nearest -- used by RADIUS's own-corner
+        # pick, same nearest-in-screen-space idea as _hit_test.
+        # `points` can be a box's plain 4-corner outline or a POLY
+        # that's already had one or more OTHER corners rounded (see
+        # _round_rect_corner) -- only corners that still exist as a
+        # plain vertex are offered, so a click near an already-rounded
+        # corner just falls through to whichever remaining one is
+        # actually nearest. Returns None if every corner's rounded.
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        x0, x1 = min(xs), max(xs)
+        y0, y1 = min(ys), max(ys)
+        candidates = []
+        for (cx, cy) in ((x0, y0), (x0, y1), (x1, y0), (x1, y1)):
+            if any(abs(p[0] - cx) < 1e-6 and abs(p[1] - cy) < 1e-6 for p in points):
+                candidates.append((cx, cy))
         best, best_dist = None, None
-        for (cx, cy) in corners:
-            p_bot = self._project(cx, cy, c0[2], scale, ox, oy)
-            p_top = self._project(cx, cy, c1[2], scale, ox, oy)
+        for (cx, cy) in candidates:
+            p_bot = self._project(cx, cy, z0, scale, ox, oy)
+            p_top = self._project(cx, cy, z1, scale, ox, oy)
             d = self._point_to_segment_dist(x, y, p_bot[0], p_bot[1], p_top[0], p_top[1])
             if best_dist is None or d < best_dist:
                 best_dist, best = d, (cx, cy)
-        x_side = "min" if best[0] == c0[0] else "max"
-        y_side = "min" if best[1] == c0[1] else "max"
+        if best is None:
+            return None
+        x_side = "min" if best[0] == x0 else "max"
+        y_side = "min" if best[1] == y0 else "max"
         return x_side, y_side
 
     def _arc_hit_dist(self, x, y, center, radius, plane, a0, a1, scale, ox, oy, segments=32):
@@ -3711,30 +3808,36 @@ class Model3DPage(Page):
             self.status_box.value = "RADIUS: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
         hit = self._hit_test(x, y)
-        if hit is None or hit[0] != "box":
+        if hit is None or hit[0] not in ("box", "poly"):
             self.status_box.value = "RADIUS: click nearer a BOX wall"
             return
-        self.radius_pick_a = hit[1]
+        self.radius_pick_a = hit  # (kind, idx) -- "poly" lets an already-rounded shape be picked again
         self.dialog = "radius_pick_b"
         self._redraw()
-        self.status_box.value = "RADIUS: first wall picked -- click the SECOND wall"
+        self.status_box.value = "RADIUS: first wall picked -- click the SECOND wall (or the SAME one again)"
 
     def _on_radius_pick_b_touch(self, x, y):
         if not self._in_canvas(x, y):
             self.status_box.value = "RADIUS: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
         hit = self._hit_test(x, y)
-        if hit is None or hit[0] != "box":
+        if hit is None or hit[0] not in ("box", "poly"):
             self.status_box.value = "RADIUS: click nearer a BOX wall"
             return
-        if hit[1] == self.radius_pick_a:
-            # same wall picked twice -- round one of ITS OWN corners
+        if hit == self.radius_pick_a:
+            # same shape picked twice -- round one of ITS OWN corners
             # instead of a corner shared with a second wall
             self.dialog = "radius_pick_corner"
             self._redraw()
-            self.status_box.value = "RADIUS: click near the CORNER of that box to round"
+            self.status_box.value = "RADIUS: click near the CORNER of that shape to round"
             return
-        self.radius_pick_b = hit[1]
+        if hit[0] != "box" or self.radius_pick_a[0] != "box":
+            # a shared-corner rounding needs two DISTINCT BOX walls --
+            # a poly (an already-rounded shape) only supports rounding
+            # its OWN further corners, picked by clicking it twice
+            self.status_box.value = "RADIUS: pick two BOX walls to share a corner, or click the SAME one twice"
+            return
+        self.radius_pick_b = hit
         self.radius_corner_side = None
         self._radius_dialog_message = ""
         self.dialog = "radius"
@@ -3744,17 +3847,31 @@ class Model3DPage(Page):
         if not self._in_canvas(x, y):
             self.status_box.value = "RADIUS: click (%d,%d) was outside the VIEW panel" % (x, y)
             return
+        kind, idx = self.radius_pick_a
         try:
-            box = self.boxes[self.radius_pick_a]
+            if kind == "box":
+                (x0, y0, z0), (x1, y1, z1) = self.boxes[idx][0], self.boxes[idx][1]
+                points = [(x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0)]
+            else:
+                points = self.polys[idx][0]
+                height = self.polys[idx][2]
+                z0, z1 = points[0][2], points[0][2] + height
         except IndexError:
             self.dialog = None
             self.radius_pick_a = None
             self._redraw()
-            self.status_box.value = "RADIUS: that box no longer exists"
+            self.status_box.value = "RADIUS: that shape no longer exists"
             return
         self.radius_pick_b = self.radius_pick_a
-        self.radius_corner_side = self._nearest_box_corner(
-            box, x, y, self._last_scale, self._last_origin[0], self._last_origin[1])
+        self.radius_corner_side = self._nearest_rect_corner(
+            points, z0, z1, x, y, self._last_scale, self._last_origin[0], self._last_origin[1])
+        if self.radius_corner_side is None:
+            self.dialog = None
+            self.radius_pick_a = None
+            self.radius_pick_b = None
+            self._redraw()
+            self.status_box.value = "RADIUS: every corner of that shape is already rounded"
+            return
         self._radius_dialog_message = ""
         self.dialog = "radius"
         self._redraw()
