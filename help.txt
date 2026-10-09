@@ -1,0 +1,127 @@
+' help.txt -- the HELP text for every club page (help.bas shows it).
+' A section starts [topic] then its title; paragraphs follow with a blank
+' line between them (help.bas wraps them to the screen). Keep every line
+' under 250 characters -- MMBasic can't read longer ones. Edit freely.
+[menu]
+Main Menu
+The plates on the dash open the club's pages: MEMBERS, EVENTS, PHOTOS, EXPORT/IMPORT, EMAIL/TXT, FINANCIAL, GAMES, GPS, ADMIN and MUSIC. QUIT closes the menu to the > prompt (RUN
+"B:/club/club.bas" starts it again).
+
+The clock and date gauges keep time; the ticker along the bottom scrolls the date and time, the weather, WiFi (OK with this board's address, or DOWN) and messages from the pages.
+
+The weather is fetched when the menu starts and every 3 minutes: for the GPS fix if there is one, else the club's town (ADMIN > UNIT NAME), else a guess from the internet connection.
+
+Keyboard: Left/Right/Up/Down move between plates, Enter or Space presses the lit one, Esc goes back on every page.
+
+[members]
+Members
+The list on the left is every member (number and name). Click one, or use Up/Down, to show their details on the right. The mouse wheel or click-and-drag scrolls the list; PgUp/PgDn move a page.
+
+Click a box on the right to type into it: Enter keeps it, Esc puts it back. RECORD > SAVE writes it to the club's file.
+
+RECORD > NEW starts a new member with the next number; CLEAR empties the form; DELETE (press twice) removes the member shown.
+
+LIST > SEARCH finds members by name, number or phone; SHOW ALL lists everyone again.
+
+LINKS > CARS shows this member's cars; PHOTO opens the photos; EMAIL opens EMAIL/TXT.
+
+[cars]
+Cars
+From MEMBERS > LINKS > CARS it lists that member's cars; VIEW > SHOW ALL lists every car. Click one (or Up/Down) to show it.
+
+RECORD > NEW, SAVE, DELETE (press twice). Member is the owner's member number; Photo is the file name of the car's picture in B:/cars.
+
+VIEW > SHOW PIC shows that photo full screen; any key or click comes back.
+
+[events]
+Events
+The club's events. Click one (or Up/Down) to show it; type into its boxes and SAVE. NEW starts a new event, DELETE (twice) removes it.
+
+Attendance: mark who came, and the page lists who attended.
+
+[financial]
+Financial
+Money in and out: date, description, category, in or out, amount and notes. Click an entry (or Up/Down) to show it, change it and SAVE; NEW for a new one; DELETE (twice) removes it.
+
+EXPORT > EXPORT CSV writes a spreadsheet file for a PC.
+
+[photos]
+Photos
+Every picture in B:/cars (.jpg and .bmp). Click one (or Up/Down), then PHOTO > SHOW PIC to see it full screen (any key or click comes back), RENAME, or DELETE (twice). VIEW > REFRESH reads
+the folder again.
+
+Big or progressive JPEGs may not show -- save them as ordinary (baseline) JPEGs.
+
+[music]
+Music
+Songs from the USB stick (C:/music) or the SD card (B:/music). Artists are folders: click a folder (or Enter on it) to open it, [..] to go back up.
+
+Click a song to pick it and again to play it (or Up/Down, then Enter). PLAY > PAUSE, RESUME, STOP.
+
+[games]
+Games
+Every game in B:/Games. Click one (or Up/Down) and click it again (or Enter) to play. Esc or QUIT in a game comes back here.
+
+[gps]
+GPS
+Big speed, course, position, height and time from the GPS module (on GP1/GP0). While it searches the page shows how many sentences it has read, how many satellites are in view and the
+strongest signal.
+
+A fix needs open sky: 0 in view means the aerial can't see any satellites; signals under about 30 dB are too weak. The last fix is kept and shown next time, and the weather uses it.
+
+[admin]
+Admin
+FILES opens FILE TRANSFER; USERS the board's login accounts; MAIL SETUP the email account and phone text gateway; WIFI the network; UNIT NAME the club's name and town.
+
+[files]
+File Transfer
+Browse A: (the board's flash), B: (SD card) and C: (USB stick) with DRIVE. Click a folder to open it, [..] to go up; click a file to pick it. Up/Down, PgUp/PgDn, Enter, Backspace (up a
+folder), Delete, and the mouse wheel or drag all work on the list.
+
+FILE > IMPORT copies the picked file to where the club keeps that kind of file: pages and data to B:/club, pictures to B:/cars, music to B:/music, anything else to B:/import. Importing a
+.pak (club.pak, clubart.pak) installs every page in it.
+
+FILE > EDIT opens a text file in the editor; DELETE (twice) removes the picked file.
+
+[edit]
+Editor
+Arrows, Home/End, PgUp/PgDn move; type to insert; Enter, Backspace, Delete; Tab puts in 2 spaces. Click to move the cursor.
+
+FILE > SAVE (or Ctrl-S) saves; SAVE & QUIT; QUIT (Esc) goes back -- twice if there are unsaved changes.
+
+Files with lines longer than 255 characters, or over 1000 lines, open view-only so a save can't damage them.
+
+[export]
+Export / Import
+EXPORT writes members, cars, events or finance (or all) to CSV spreadsheet files for a PC. IMPORT reads a CSV back in, merged with what's there.
+
+[message]
+Email / Txt
+Send one message to members by email and/or text. Send to: ALL members, or only the ones ticked in the list (click a name, or Up/Down then Enter). Paid only limits it to financial members.
+
+EMAIL and SMS switch each way on or off. Type a Subject and up to 4 lines of message, then SEND -- press it twice; the first press says how many will get it.
+
+Needs ADMIN > MAIL SETUP filled in first.
+
+[users]
+Users
+The board's login accounts: click one (or Up/Down) to edit it. Type a password only to change it (it's shown as stars and never stored as typed). Click Role to swap admin/operator. SAVE,
+CLEAR (new account), DELETE (twice). The last account and the last admin can't be deleted.
+
+[mailsetup]
+Mail Setup
+MODE switches between EMAIL (the club's mail account) and SMS (the phone running the SMS Gateway app). Fill in the boxes, SAVE, then TEST sends a test email or text.
+
+Email uses port 465 (encrypted from the start). The phone's IP and username are shown in the SMS Gateway app.
+
+[wifi]
+WiFi
+The top line says whether this board is connected, and its address. SCAN lists the networks it can hear (with signal bars); click one and type its password.
+
+CONNECT: the firmware only lets the WiFi be changed at the > prompt -- press Ctrl-C and type OPTION WIFI "network", "password".
+
+[unitname]
+Unit Name
+Name: the club's name, shown on the menu (blank = CAR CLUB).
+
+Town: the club's town, for the weather when there's no GPS fix -- e.g. Bendigo, or Kyneton Victoria. SAVE looks it up and shows where the weather is for.

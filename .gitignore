@@ -9,3 +9,18 @@ upload_log.txt
 exports/
 cars/
 models/
+
+# Added 2026-10-09: keep private member data, binaries and local tooling out of the public repo.
+*.dat
+card_for_board/
+*.pak
+*.zip
+*.uf2
+*.elf
+*.bin
+.claude/
+TFTP*
+__pycache__/
+assets/2026*.jpg
+club_data_workbook.xlsx
+SMS_Setup_Guide.docx

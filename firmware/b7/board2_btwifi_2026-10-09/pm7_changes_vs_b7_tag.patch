@@ -1,0 +1,342 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 927b68d..a87cffb 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,6 +21,7 @@ set(VALID_COMPILE_VARIANTS
+ 	PICOBTHRP2350
+ 	HDMIBTH
+ 	HDMIWEB
++	HDMIBTHWEB
+ )
+ 
+ # VS Code uses this default when COMPILE is not supplied explicitly.
+@@ -170,6 +171,7 @@ set(RP2350_VARIANTS
+ 	PICOBTHRP2350
+ 	HDMIBTH
+ 	HDMIWEB
++	HDMIBTHWEB
+ )
+ 
+ set(BT_VARIANTS
+@@ -185,12 +187,14 @@ set(BT_VARIANTS
+ set(BTH_VARIANTS
+ 	PICOBTHRP2350
+ 	HDMIBTH
++	HDMIBTHWEB
+ )
+ 
+ set(WEB_VARIANTS
+ 	WEB
+ 	WEBRP2350
+ 	HDMIWEB
++	HDMIBTHWEB
+ )
+ 
+ set(GUI_VARIANTS
+@@ -211,6 +215,7 @@ set(USB_HOST_VARIANTS
+ 	HDMIUSB
+ 	HDMIBTH
+ 	HDMIWEB
++	HDMIBTHWEB
+ )
+ 
+ set(UPNG_VARIANTS
+@@ -225,6 +230,7 @@ set(UPNG_VARIANTS
+ 	PICOBTHRP2350
+ 	HDMIBTH
+ 	HDMIWEB
++	HDMIBTHWEB
+ )
+ 
+ set(RAYCASTER_VARIANTS
+@@ -238,6 +244,7 @@ set(RAYCASTER_VARIANTS
+ 	PICOBTHRP2350
+ 	HDMIBTH
+ 	HDMIWEB
++	HDMIBTHWEB
+ )
+ 
+ set(VGA_PIO_VARIANTS
+@@ -259,6 +266,7 @@ set(HDMI_VARIANTS
+ 	HDMIUSB
+ 	HDMIBTH
+ 	HDMIWEB
++	HDMIBTHWEB
+ )
+ 
+ set(PICOMITE_VARIANTS
+@@ -293,6 +301,7 @@ set(PICO_RAND_VARIANTS
+ 	PICOBTHRP2350
+ 	HDMIBTH
+ 	HDMIWEB
++	HDMIBTHWEB
+ )
+ set(USES_SUBPROFILE_VARIANTS
+ 	HDMIUSB
+@@ -306,11 +315,14 @@ set(USES_SUBPROFILE_VARIANTS
+ 	PICOBTHRP2350
+ 	HDMIBTH
+ 	HDMIWEB
++	HDMIBTHWEB
+ )
+ compile_is_in(IS_RP2350 ${RP2350_VARIANTS})
+ compile_is_in(IS_WEB ${WEB_VARIANTS})
+ compile_is_in(IS_WEBRP2350 WEBRP2350)
+-compile_is_in(IS_HDMIWEB HDMIWEB)
++compile_is_in(IS_HDMIWEB HDMIWEB HDMIBTHWEB)
++compile_is_in(IS_COMBO HDMIBTHWEB)
++compile_is_in(IS_HDMIBTHID HDMIBTH HDMIBTHWEB)
+ compile_is_in(HAS_GUI ${GUI_VARIANTS})
+ compile_is_in(IS_PICOMIN PICOMIN)
+ compile_is_in(IS_FULL_RP2040 ${FULL_RP2040_VARIANTS})
+@@ -760,7 +772,7 @@ if(IS_PICOMITE AND NOT IS_BT AND NOT IS_BTH)
+ 	)
+ endif()
+ 
+-if((IS_BT OR IS_BTH) AND NOT COMPILE STREQUAL "HDMIBTH")
++if((IS_BT OR IS_BTH) AND NOT IS_HDMIBTHID)
+ 	# IS_BT / IS_BTH each supply their own PICO_HEAP_SIZE / PICO_CORE0_STACK_SIZE
+ 	# / GUICONTROLS below; PICOMITE is still defined here so the existing
+ 	# PicoMite RP2350 code paths fire. Excluded for HDMIBTH because that
+@@ -809,7 +821,7 @@ if(IS_HDMI)
+ 		HDMI
+ 		GUICONTROLS
+ 	)
+-	if(NOT COMPILE STREQUAL "HDMIBTH" AND NOT COMPILE STREQUAL "HDMIWEB")
++	if(NOT IS_HDMIBTHID AND NOT IS_HDMIWEB)
+ 		target_compile_definitions(PicoMite PRIVATE
+ 			PICO_HEAP_SIZE=0x800
+ 			PICO_CORE0_STACK_SIZE=0x2000
+@@ -824,12 +836,12 @@ if(IS_HDMI)
+ 	# (combined with a runtime clk_sys change between the per-resolution CPU
+ 	# speeds). This is purely the display concern; the BLE-HID-host concern
+ 	# stays gated on PICOMITEHDMIBTH so HDMIWEB does not pull in btstack.
+-	if(COMPILE STREQUAL "HDMIBTH" OR COMPILE STREQUAL "HDMIWEB")
++	if(IS_HDMIBTHID OR IS_HDMIWEB)
+ 		target_compile_definitions(PicoMite PRIVATE HDMICUTDOWN)
+ 	endif()
+ endif()
+ 
+-if(COMPILE STREQUAL "HDMIBTH")
++if(IS_HDMIBTHID)
+ 	# HDMIBTH = HDMIUSB + BLE HID host (Bluetooth keyboard + heartbeat
+ 	# LED on the CYW43 chip). HDMIBTH is in BTH_VARIANTS so IS_BTH
+ 	# fires — that block pulls in BTKeyboard.c, links pico_btstack_ble /
+@@ -839,8 +851,10 @@ if(COMPILE STREQUAL "HDMIBTH")
+ 	# the HDMIBTH-specific identity.
+ 	target_compile_definitions(PicoMite PRIVATE
+ 		PICOMITEHDMIBTH
+-		CYW43_HOST_NAME="PicoMiteHDMIBTH"
+ 	)
++	if(NOT IS_COMBO)
++		target_compile_definitions(PicoMite PRIVATE CYW43_HOST_NAME="PicoMiteHDMIBTH")
++	endif()
+ endif()
+ 
+ if(IS_WEB)
+@@ -929,13 +943,19 @@ if(IS_BTH)
+ 	# apply to all BTH variants (currently PICOBTHRP2350 and HDMIBTH).
+ 	target_compile_definitions(PicoMite PRIVATE
+ 		CYW43_ENABLE_BLUETOOTH=1
+-		CYW43_PIO_CLOCK_DIV_DYNAMIC=1
+-		PICO_HEAP_SIZE=0x4000
+-		PICO_CORE0_STACK_SIZE=0x4000
+-		GUICONTROLS
+-		# dual-mode btstack: Classic for the A2DP speaker link
+ 		ENABLE_CLASSIC=1
+ 	)
++	# the combined WiFi+Bluetooth build gets its CYW43 clock define, heap and
++	# stack sizes and GUICONTROLS from the WiFi block; defining them twice
++	# would clash
++	if(NOT IS_COMBO)
++		target_compile_definitions(PicoMite PRIVATE
++			CYW43_PIO_CLOCK_DIV_DYNAMIC=1
++			PICO_HEAP_SIZE=0x4000
++			PICO_CORE0_STACK_SIZE=0x4000
++			GUICONTROLS
++		)
++	endif()
+ 	# btstack_config.h lives in bluetooth/ (the btstack library includes it
+ 	# by bare name, so that dir must be on the include path for BT builds).
+ 	target_include_directories(PicoMite PRIVATE ${CMAKE_CURRENT_LIST_DIR}/bluetooth)
+@@ -1016,9 +1036,12 @@ if(IS_BTH)
+ 	target_link_libraries(PicoMite
+ 		pico_btstack_ble
+ 		pico_btstack_cyw43
+-		pico_cyw43_arch_none
+ 		pico_btstack_sbc_encoder
+ 	)
++	# the WiFi+Bluetooth build uses the lwIP poll backend (linked for IS_WEB)
++	if(NOT IS_COMBO)
++		target_link_libraries(PicoMite pico_cyw43_arch_none)
++	endif()
+ 	# The SDK's default TLV bank is inside the A: drive; BTKeyboard.c hands
+ 	# btstack_cyw43_init() the Option-backed store instead.
+ 	target_link_options(PicoMite PRIVATE
+diff --git a/PicoMite.c b/PicoMite.c
+index 678a4c8..a736c79 100644
+--- a/PicoMite.c
++++ b/PicoMite.c
+@@ -212,7 +212,9 @@ uint8_t PSRAMpin;
+ #endif
+ #ifdef USBKEYBOARD
+ #ifdef HDMI
+-#ifdef PICOMITEHDMIBTH
++#if defined(PICOMITEHDMIBTH) && defined(PICOMITEHDMIWEB)
++#define MES_SIGNON "\rPicoMiteHDMIBTHWEB MMBasic USB " CHIP " Edition V" VERSION "\r\n"
++#elif defined(PICOMITEHDMIBTH)
+ #define MES_SIGNON "\rPicoMiteHDMIBTH MMBasic USB " CHIP " Edition V" VERSION "\r\n"
+ #elif defined(PICOMITEHDMIWEB)
+ #define MES_SIGNON "\rPicoMiteHDMIWEB MMBasic USB " CHIP " Edition V" VERSION "\r\n"
+@@ -4048,7 +4050,7 @@ uint32_t testPSRAM(void)
+             bt_console_init();
+         }
+ #endif
+-#if defined(PICOMITEBTH) || defined(PICOMITEHDMIBTH)
++#if (defined(PICOMITEBTH) || defined(PICOMITEHDMIBTH)) && !defined(PICOMITEWEB)
+ #ifdef PICOMITEHDMIBTH
+         /* HDMICore hardcodes DMACH_PING=0 / DMACH_PONG=1 (see the HDMI
+            scanout block above). CYW43's bus_pio_spi grabs two unused
+@@ -4164,7 +4166,11 @@ uint32_t testPSRAM(void)
+            than "PicoMiteHDMI", so the A/B insertion point shifts by 3:
+            banner[35] is the trailing space inside the CHIP macro
+            "RP2350 ". */
++#if defined(PICOMITEHDMIBTH) && defined(PICOMITEHDMIWEB)
++        banner[38] = (rp2350a ? 'A' : 'B'); /* HDMIBTHWEB is 3 chars longer again */
++#else
+         banner[35] = (rp2350a ? 'A' : 'B');
++#endif
+ #else
+         banner[32] = (rp2350a ? 'A' : 'B');
+ #endif
+@@ -4390,6 +4396,12 @@ uint32_t testPSRAM(void)
+                                         (unsigned)cyw43_div,
+                                         (unsigned)(clock_get_hz(clk_sys) / (2 * cyw43_div) / 1000));
+                                 MMPrintString(dbg);*/
++#if defined(PICOMITEHDMIBTH)
++                /* WiFi + Bluetooth build: the one cyw43 init is the one
++                   above, so start the Bluetooth stack here, before
++                   WebConnect() (which can take up to 30 s to join) */
++                bt_keyboard_init();
++#endif
+                 startupcomplete = 1;
+                 WebConnect();
+             }
+diff --git a/bluetooth/BTAudio.c b/bluetooth/BTAudio.c
+index dad522a..7066b32 100644
+--- a/bluetooth/BTAudio.c
++++ b/bluetooth/BTAudio.c
+@@ -445,6 +445,10 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
+             sbc_mode = SBC_CHANNEL_MODE_MONO;
+             break;
+         }
++        /* EXPERIMENT (carclub, 2026-10-09): cap the bitpool to lower the bitrate and see
++           whether the dropped samples with WiFi up are a radio-throughput limit. */
++        if (bitpool > 28)
++            bitpool = 28;
+         cfg_rate = rate;
+         cfg_channel_mode = sbc_mode;
+         cfg_bitpool = bitpool;
+diff --git a/bluetooth/BTKeyboard.c b/bluetooth/BTKeyboard.c
+index f0f2b61..ed8e003 100644
+--- a/bluetooth/BTKeyboard.c
++++ b/bluetooth/BTKeyboard.c
+@@ -1440,6 +1440,13 @@ static void bth_raw_notification_handler(uint8_t packet_type,
+     uint16_t vh = gatt_event_notification_get_value_handle(packet);
+     uint16_t vlen = gatt_event_notification_get_value_length(packet);
+     const uint8_t *val = gatt_event_notification_get_value(packet);
++    { /* CARCLUB DEBUG: show every HID notification (handle, length, bytes) */
++        char dbg[120]; int n = snprintf(dbg, sizeof dbg, "\r\n[BT n h=%04x len=%u:", (unsigned)vh, (unsigned)vlen);
++        for (uint16_t i = 0; i < vlen && i < 16 && n < (int)sizeof dbg - 6; i++)
++            n += snprintf(dbg + n, sizeof dbg - n, " %02X", val[i]);
++        snprintf(dbg + n, sizeof dbg - n, "]\r\n> ");
++        MMPrintString(dbg);
++    }
+ 
+     /* 8-byte notifications are HID boot-keyboard reports (modifier +
+        reserved + 6 keycodes). Mouse reports are identified by their
+@@ -1477,6 +1484,15 @@ static void bth_raw_notification_handler(uint8_t packet_type,
+         return;
+     }
+ 
++    /* A keyboard that sends its input as report ID + the 8 boot-keyboard
++       bytes (a 9-byte notification, like many Logitech BLE keyboards) is
++       decoded the same way, skipping the leading report ID. */
++    if (vlen == 9 && val[0] == 1)
++    {
++        process_kbd_report((const hid_keyboard_report_t *)(val + 1), 0);
++        return;
++    }
++
+     /* Gamepad report? Dispatches on the parsed gamepad descriptor's
+        report_bits. Currently only prints the decoded axes/hat/buttons
+        to the console — DEVICE(GAMEPAD …) wiring is a follow-up. */
+diff --git a/configuration.h b/configuration.h
+index bf624a1..d31046f 100644
+--- a/configuration.h
++++ b/configuration.h
+@@ -72,7 +72,19 @@ extern "C"
+ #define MAX_CPU Freq378P
+ #define MIN_CPU FreqX
+ #ifdef USBKEYBOARD
+-#ifdef PICOMITEHDMIBTH
++#if defined(PICOMITEHDMIBTH) && defined(PICOMITEHDMIWEB)
++   /* HDMIBTHWEB: HDMIUSB-style display + USB host + CYW43 shared between
++      WebMite WiFi/lwIP/mbedtls (telnet, TFTP, WEB commands) and the BLE
++      HID host + A2DP speaker. The image holds both stacks, so the flash
++      offset is above either build's, and the heap is below HDMIBTH's because
++      the lwIP pool and btstack buffers are both in BSS now. All three
++      numbers are provisional: tune against the linker's RAM / flash errors
++      and GetHighestHexAddress.py. FLASH_TARGET_OFFSET stays 16 KB-aligned. */
++#define FLASH_TARGET_OFFSET (1696 * 1024)
++#define HEAP_MEMORY_SIZE (184 * 1024)
++#define MAX_PROG_SIZE (156 * 1024)
++#define MagicKey 0x6B7E4C91
++#elif defined(PICOMITEHDMIBTH)
+    /* HDMIBTH: HDMIUSB-style display stack + CYW43 wireless + BLE HID
+       host. The CYW43 firmware blob (~220 KB linked via the IS_BTH
+       block) pushes the firmware image well past HDMIUSB's 1056 KB
+diff --git a/core/MM_Misc.c b/core/MM_Misc.c
+index 5bde803..f7755ec 100644
+--- a/core/MM_Misc.c
++++ b/core/MM_Misc.c
+@@ -8080,7 +8080,9 @@ void MIPS16 fun_device(void)
+ #ifdef PICOMITEVGA
+ #ifdef USBKEYBOARD
+ #ifdef HDMI
+-#ifdef PICOMITEHDMIBTH
++#if defined(PICOMITEHDMIBTH) && defined(PICOMITEHDMIWEB)
++    strcpy((char *)sret, "PicoMiteHDMIBTHWEB");
++#elif defined(PICOMITEHDMIBTH)
+     strcpy((char *)sret, "PicoMiteHDMIBTH");
+ #elif defined(PICOMITEHDMIWEB)
+     strcpy((char *)sret, "PicoMiteHDMIWEB");
+diff --git a/net/WiFi.c b/net/WiFi.c
+index dce844c..b94f7ae 100644
+--- a/net/WiFi.c
++++ b/net/WiFi.c
+@@ -9,6 +9,9 @@
+ #include "MMBasic_Includes.h"
+ #include "Hardware_Includes.h"
+ #include "WiFi.h"
++#if defined(PICOMITEHDMIBTH)
++#include "BTAudio.h" // bt_audio_streaming(): leave the LED alone while a speaker streams
++#endif
+ #ifdef PICOMITEWEB
+ #include "lwipopts.h"
+ #include "pico/cyw43_arch.h"
+@@ -392,6 +395,14 @@
+         static uint64_t lastheartmsec = 0;
+         if (!startupcomplete)
+             return;
++#if defined(PICOMITEHDMIBTH)
++        /* Every LED change is a CYW43 control call under the async-context lock,
++           and now and then one waits out its 500 ms timeout - stalling the
++           Bluetooth audio encoder that runs in that context (the same reason
++           bt_keyboard_poll() leaves the LED alone while a speaker streams). */
++        if (bt_audio_streaming())
++            return;
++#endif
+         if (Option.NoHeartbeat)
+         {
+             if (lastonoff != 2)
